@@ -1,0 +1,33 @@
+# Local Python/tooling environments
+.venv/
+.uv-cache/
+.uv-python/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+wheelhouse/
+*.egg-info/
+
+# Upstream/runtime outputs
+data/
+checkpoints/
+wandb/
+outputs/
+multirun/
+submission.json
+*.pt
+*.pth
+*.ckpt
+
+# Dataset build artifacts
+*.npy
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

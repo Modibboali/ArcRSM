@@ -1,0 +1,18 @@
+-r kaggle-model-eval.txt
+
+# Training/config/logging packages. The adam-atan2 sdist must be built against
+# the already-installed Kaggle torch/CUDA stack with --no-build-isolation.
+adam-atan2==0.0.3
+tqdm==4.67.1
+coolname==2.2.0
+wandb==0.21.3
+omegaconf==2.3.0
+hydra-core==1.3.2
+PyYAML==6.0.2
+
+# Needed to build the source-only optimizer in an offline Kaggle session.
+packaging==24.1
+ninja==1.13.0
+wheel==0.45.1
+setuptools==80.9.0
+setuptools-scm==9.2.0

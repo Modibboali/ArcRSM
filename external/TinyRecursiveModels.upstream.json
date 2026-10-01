@@ -1,8 +1,0 @@
-{
-  "repository": "https://github.com/SamsungSAILMontreal/TinyRecursiveModels.git",
-  "commit": "c01103738605ba39d1430519b1ee0c62f4c707f8",
-  "commit_date": "2026-03-31T20:50:39-04:00",
-  "license": "MIT",
-  "path": "external/TinyRecursiveModels",
-  "policy": "Keep this checkout unmodified; implement project variants outside it."
-}

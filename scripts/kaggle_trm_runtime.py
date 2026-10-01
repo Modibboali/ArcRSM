@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -10,9 +11,27 @@ import torch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+UPSTREAM_ROOT = Path(
+    os.environ.get(
+        "TRM_UPSTREAM_ROOT", PROJECT_ROOT / "external" / "TinyRecursiveModels"
+    )
+).expanduser().resolve()
+if not all(
+    (UPSTREAM_ROOT / relative).is_file()
+    for relative in (
+        "models/losses.py",
+        "models/recursive_reasoning/trm.py",
+    )
+):
+    raise FileNotFoundError(
+        f"TinyRecursiveModels source not found at {UPSTREAM_ROOT}. The project pins "
+        "it as a Git submodule; initialize it with `git submodule update --init "
+        "--recursive external/TinyRecursiveModels`, or attach the pinned checkout "
+        "as Kaggle input and set TRM_UPSTREAM_ROOT to its mounted path."
+    )
 for import_path in (
     PROJECT_ROOT / "src",
-    PROJECT_ROOT / "external" / "TinyRecursiveModels",
+    UPSTREAM_ROOT,
 ):
     text_path = str(import_path)
     if text_path not in sys.path:
@@ -85,8 +104,15 @@ def build_loss_model(config: dict[str, Any], *, operator: str, device: torch.dev
     return loss_model.to(device)
 
 
+def create_initial_carry(loss_model, batch):
+    # Upstream pretrain/eval wraps initial_carry this way so its fresh tensors
+    # (steps, halted, and recursive states) are allocated beside the CUDA batch.
+    with torch.device(batch["inputs"].device):
+        return loss_model.initial_carry(batch)
+
+
 def model_step(loss_model, batch, *, return_outputs: bool = True):
-    carry = loss_model.initial_carry(batch)
+    carry = create_initial_carry(loss_model, batch)
     return loss_model(
         carry=carry,
         batch=batch,
@@ -102,6 +128,8 @@ def check_training_result(result, *, batch_size: int, seq_len: int, vocab_size: 
         raise RuntimeError("Unexpected lm_head output shape")
     if outputs["q_halt_logits"].shape != (batch_size,):
         raise RuntimeError("Unexpected q_head output shape")
+    if not bool(torch.isfinite(outputs["q_halt_logits"]).all()):
+        raise RuntimeError("q_head logits contain non-finite values")
     if carry.inner_carry.z_H.shape[0] != batch_size:
         raise RuntimeError("Unexpected z_H carry batch dimension")
     if not bool(torch.isfinite(outputs["logits"]).all()):

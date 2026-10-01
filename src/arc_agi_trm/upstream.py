@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping
@@ -11,13 +12,21 @@ SUPPORTED_OPERATORS = ("attention", "mamba2_attention", "experimental_2d_ssm")
 
 
 def upstream_root() -> Path:
+    configured_root = os.environ.get("TRM_UPSTREAM_ROOT")
+    if configured_root:
+        return Path(configured_root).expanduser().resolve()
     return Path(__file__).resolve().parents[2] / "external" / "TinyRecursiveModels"
 
 
 def _load_model_class():
     root = upstream_root()
     if not (root / "models" / "recursive_reasoning" / "trm.py").is_file():
-        raise FileNotFoundError(f"TinyRecursiveModels checkout not found at {root}")
+        raise FileNotFoundError(
+            f"TinyRecursiveModels source not found at {root}. Initialize the pinned "
+            "submodule with `git submodule update --init --recursive "
+            "external/TinyRecursiveModels`, or set TRM_UPSTREAM_ROOT to an attached "
+            "copy of the pinned checkout (required when Kaggle internet is disabled)."
+        )
     root_text = str(root)
     if root_text not in sys.path:
         sys.path.insert(0, root_text)

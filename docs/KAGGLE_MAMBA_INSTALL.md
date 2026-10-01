@@ -6,6 +6,30 @@ operator wheel family is `causal-conv1d==1.6.2.post1` and
 CUDA 12.x, and PyTorch's CXX11 ABI set to `TRUE`. These are target
 requirements, not evidence that the wheels have been tested in this workspace.
 
+## Make the pinned TRM source available
+
+This project records the unmodified upstream TRM checkout as a Git submodule.
+For an online clone, initialize it with:
+
+```bash
+git submodule update --init --recursive external/TinyRecursiveModels
+```
+
+Because Kaggle runs without internet, ensure that pinned source is already
+available in the notebook image or attach it as a Kaggle Dataset. The mounted
+directory must contain `models/losses.py` and
+`models/recursive_reasoning/trm.py`. If it is mounted at
+`/kaggle/input/trm-upstream/TinyRecursiveModels`, set this before running the
+qualification or dataset scripts:
+
+```bash
+export TRM_UPSTREAM_ROOT=/kaggle/input/trm-upstream/TinyRecursiveModels
+```
+
+The scripts also accept the default in-repository path
+`external/TinyRecursiveModels/`. They fail early with setup instructions if
+neither location contains the required source.
+
 ## Prepare and attach the wheel dataset
 
 On a separate internet-enabled, ABI-matched Linux build environment, obtain or

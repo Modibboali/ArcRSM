@@ -1,8 +1,8 @@
 # ARC-AGI-2 TRM research baseline
 
-This workspace vendors the official Samsung SAIL Montreal Tiny Recursive
-Models (TRM) implementation and keeps it unchanged as the control baseline for
-later operator experiments.
+This workspace pins the official Samsung SAIL Montreal Tiny Recursive Models
+(TRM) implementation as an upstream Git submodule and keeps it unchanged as
+the control baseline for later operator experiments.
 
 - Upstream checkout: `external/TinyRecursiveModels/`
 - Pinned revision: `c01103738605ba39d1430519b1ee0c62f4c707f8`
@@ -12,6 +12,16 @@ later operator experiments.
 - Kaggle 2026 filename adapter: `scripts/build_arc_agi2_from_kaggle.py`
 - Environment inventory: `scripts/audit_environment.py`
 - Smoke tests: `tests/`
+
+Initialize the pinned upstream checkout when cloning the project:
+
+```bash
+git submodule update --init --recursive external/TinyRecursiveModels
+```
+
+For offline Kaggle runs, attach the same pinned checkout as a Kaggle Dataset
+and set `TRM_UPSTREAM_ROOT` to the mounted directory containing `models/` before
+running the scripts. This avoids requiring a submodule fetch from the notebook.
 
 The project-side `build_trm(..., operator="attention")` factory preserves the
 upstream attention baseline. The optional `mamba2_attention` hybrid can be

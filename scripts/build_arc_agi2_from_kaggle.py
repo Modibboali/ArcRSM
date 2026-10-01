@@ -15,7 +15,11 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-UPSTREAM_ROOT = PROJECT_ROOT / "external" / "TinyRecursiveModels"
+UPSTREAM_ROOT = Path(
+    os.environ.get(
+        "TRM_UPSTREAM_ROOT", PROJECT_ROOT / "external" / "TinyRecursiveModels"
+    )
+).expanduser().resolve()
 
 KAGGLE_TO_UPSTREAM = {
     "arc-agi_training_challenges.json": "arc-agi_training2_challenges.json",
@@ -60,6 +64,13 @@ def build_dataset(
         raise FileExistsError(f"Refusing to overwrite non-empty output directory: {output_dir}")
 
     output_dir.parent.mkdir(parents=True, exist_ok=True)
+    if not (UPSTREAM_ROOT / "dataset" / "build_arc_dataset.py").is_file():
+        raise FileNotFoundError(
+            f"TinyRecursiveModels source not found at {UPSTREAM_ROOT}. Initialize the "
+            "pinned submodule with `git submodule update --init --recursive "
+            "external/TinyRecursiveModels`, or set TRM_UPSTREAM_ROOT to an attached "
+            "copy of the pinned checkout."
+        )
     if str(UPSTREAM_ROOT) not in sys.path:
         sys.path.insert(0, str(UPSTREAM_ROOT))
     from dataset.build_arc_dataset import DataProcessConfig, convert_dataset

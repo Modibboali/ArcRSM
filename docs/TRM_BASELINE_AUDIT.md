@@ -2,8 +2,8 @@
 
 ## Repository integration
 
-The official archived repository is cloned at
-`external/TinyRecursiveModels/` and remains a standalone Git checkout.
+The official archived repository is pinned as a Git submodule at
+`external/TinyRecursiveModels/` and remains unmodified.
 
 | Item | Value |
 |---|---|

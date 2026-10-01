@@ -18,6 +18,7 @@ from kaggle_trm_runtime import (
     assert_finite_gradients,
     build_loss_model,
     check_training_result,
+    create_initial_carry,
     make_batch,
     make_config,
     memory_report,
@@ -239,7 +240,7 @@ def compile_test(
             carry=carry, batch=values, return_keys=("logits", "q_halt_logits")
         )
     )
-    carry = loss_model.initial_carry(batch)
+    carry = create_initial_carry(loss_model, batch)
     loss_model.zero_grad(set_to_none=True)
     result = compiled_forward(carry, batch)
     _carry, loss, _metrics, outputs, _finished = result

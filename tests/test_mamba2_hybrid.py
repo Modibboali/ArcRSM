@@ -136,6 +136,31 @@ def test_missing_mamba_dependency_has_actionable_error(monkeypatch) -> None:
         )
 
 
+def test_missing_upstream_source_has_submodule_setup_hint(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("TRM_UPSTREAM_ROOT", str(tmp_path / "not-present"))
+
+    with pytest.raises(FileNotFoundError, match="git submodule update --init"):
+        build_trm(tiny_config())
+
+
+def test_kaggle_runtime_initializes_carry_on_batch_device() -> None:
+    from scripts.kaggle_trm_runtime import create_initial_carry
+
+    model = build_trm(tiny_config())
+    loss_model = ACTLossHead(model, loss_type="stablemax_cross_entropy")
+    batch = {
+        name: torch.empty_like(value, device="meta")
+        for name, value in synthetic_batch().items()
+    }
+
+    carry = create_initial_carry(loss_model, batch)
+
+    assert carry.steps.device.type == "meta"
+    assert carry.halted.device.type == "meta"
+    assert carry.inner_carry.z_H.device.type == "meta"
+    assert all(value.device.type == "meta" for value in carry.current_data.values())
+
+
 def test_real_arc_encoded_batch_runs_through_hybrid_test_operator(tmp_path) -> None:
     source = tmp_path / "arc-files"
     built = tmp_path / "arc-arrays"

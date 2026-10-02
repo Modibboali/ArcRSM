@@ -1,33 +1,26 @@
 # ARC-AGI-2 TRM research baseline
 
-This workspace pins the official Samsung SAIL Montreal Tiny Recursive Models
-(TRM) implementation as an upstream Git submodule and keeps it unchanged as
-the control baseline for later operator experiments.
+This workspace vendors the official Samsung SAIL Montreal Tiny Recursive Models
+(TRM) implementation at a pinned upstream revision and keeps that copy unchanged
+as the control baseline for later operator experiments.
 
-- Upstream checkout: `external/TinyRecursiveModels/`
+- Vendored upstream checkout: `external/TinyRecursiveModels/`
 - Pinned revision: `c01103738605ba39d1430519b1ee0c62f4c707f8`
-- License: upstream MIT license retained in the checkout
+- License: upstream MIT license retained in the vendored checkout
 - Baseline/audit: `docs/TRM_BASELINE_AUDIT.md`
 - Dependency report: `docs/DEPENDENCY_COMPATIBILITY.md`
 - Kaggle 2026 filename adapter: `scripts/build_arc_agi2_from_kaggle.py`
 - Environment inventory: `scripts/audit_environment.py`
 - Smoke tests: `tests/`
 
-Initialize the pinned upstream checkout when cloning the project:
-
-```bash
-git submodule update --init --recursive external/TinyRecursiveModels
-```
-
-For offline Kaggle runs, attach the same pinned checkout as a Kaggle Dataset
-and set `TRM_UPSTREAM_ROOT` to the mounted directory containing `models/` before
-running the scripts. This avoids requiring a submodule fetch from the notebook.
+No Git submodule initialization is required. A normal clone contains the pinned
+TRM source under `external/TinyRecursiveModels/`, including offline Kaggle runs.
 
 The project-side `build_trm(..., operator="attention")` factory preserves the
-upstream attention baseline. The optional `mamba2_attention` hybrid can be
-architecture-tested locally with an injected fake mixer; the real CUDA-backed
-Mamba dependency is lazy-loaded and must be qualified in Kaggle. The reserved
-`experimental_2d_ssm` operator is explicitly unimplemented.
+upstream attention baseline. The optional `mamba2_attention` hybrid replaces
+the per-step reasoning operator while preserving the upstream recursion,
+dataset representation, and evaluator. The reserved `experimental_2d_ssm`
+operator is explicitly unimplemented.
 
 Run the CPU smoke suite from the repository root:
 
@@ -35,8 +28,8 @@ Run the CPU smoke suite from the repository root:
 python -m pytest -q
 ```
 
-For the offline Kaggle Mamba wheel procedure and manual GPU validation scripts,
-see [`docs/KAGGLE_MAMBA_INSTALL.md`](docs/KAGGLE_MAMBA_INSTALL.md).
+For the offline Kaggle Mamba wheel procedure and GPU validation scripts, see
+[`docs/KAGGLE_MAMBA_INSTALL.md`](docs/KAGGLE_MAMBA_INSTALL.md).
 
 Build arrays from an attached ARC Prize 2026 dataset without copying or
 renaming the competition JSON files:

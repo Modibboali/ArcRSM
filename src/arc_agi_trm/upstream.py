@@ -22,10 +22,9 @@ def _load_model_class():
     root = upstream_root()
     if not (root / "models" / "recursive_reasoning" / "trm.py").is_file():
         raise FileNotFoundError(
-            f"TinyRecursiveModels source not found at {root}. Initialize the pinned "
-            "submodule with `git submodule update --init --recursive "
-            "external/TinyRecursiveModels`, or set TRM_UPSTREAM_ROOT to an attached "
-            "copy of the pinned checkout (required when Kaggle internet is disabled)."
+            f"TinyRecursiveModels source not found at {root}. This repository keeps "
+            "the pinned source under external/TinyRecursiveModels; for an attached "
+            "offline copy, set TRM_UPSTREAM_ROOT to the directory containing models/."
         )
     root_text = str(root)
     if root_text not in sys.path:
@@ -71,6 +70,15 @@ def build_trm(
         "d_state": int(config.get("mamba_d_state", 128)),
         "headdim": int(config.get("mamba_headdim", 64)),
         "expand": int(config.get("mamba_expand", 2)),
+        "d_conv": int(config.get("mamba_d_conv", 4)),
+        "d_ssm": config.get("mamba_d_ssm", None),
+        "ngroups": int(config.get("mamba_ngroups", 1)),
+        "rmsnorm": bool(config.get("mamba_rmsnorm", True)),
+        "norm_before_gate": bool(config.get("mamba_norm_before_gate", False)),
+        "chunk_size": int(config.get("mamba_chunk_size", 256)),
+        "use_mem_eff_path": bool(config.get("mamba_use_mem_eff_path", True)),
+        "bias": bool(config.get("mamba_bias", False)),
+        "conv_bias": bool(config.get("mamba_conv_bias", True)),
     }
     model.inner.L_level.layers = model.inner.L_level.layers.__class__(
         [
@@ -82,4 +90,9 @@ def build_trm(
             for _ in range(hidden_config.L_layers)
         ]
     )
+    if len(model.inner.L_level.layers) != hidden_config.L_layers or any(
+        not isinstance(layer, Mamba2AttentionBlock)
+        for layer in model.inner.L_level.layers
+    ):
+        raise RuntimeError("Mamba-2 hybrid block installation did not complete")
     return model

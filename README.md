@@ -1,27 +1,36 @@
 # ARC-AGI-2 TRM research baseline
 
-This workspace pins the official Samsung SAIL Montreal Tiny Recursive Models
-(TRM) implementation as an upstream Git submodule and keeps it unchanged as
-the control baseline for later operator experiments.
+This workspace includes the official Samsung SAIL Montreal Tiny Recursive
+Models (TRM) source as an unchanged, individually tracked snapshot for the
+attention control baseline and project-owned operator experiments.
 
-- Upstream checkout: `external/TinyRecursiveModels/`
+- Upstream source snapshot: `external/TinyRecursiveModels/`
 - Pinned revision: `c01103738605ba39d1430519b1ee0c62f4c707f8`
 - License: upstream MIT license retained in the checkout
 - Baseline/audit: `docs/TRM_BASELINE_AUDIT.md`
 - Dependency report: `docs/DEPENDENCY_COMPATIBILITY.md`
-- Kaggle 2026 filename adapter: `scripts/build_arc_agi2_from_kaggle.py`
+- Kaggle ARC-AGI-2 training/validation builder: `scripts/build_arc_agi2_from_kaggle.py`
 - Environment inventory: `scripts/audit_environment.py`
 - Smoke tests: `tests/`
 
-Initialize the pinned upstream checkout when cloning the project:
+The checked-in `external/` tree is already available after cloning. This Git
+repository has a pre-existing unmatched `trm-temp` gitlink without a
+`.gitmodules` entry; it is left untouched. For an offline Kaggle run, attach a
+copy of the pinned source and set `TRM_UPSTREAM_ROOT` to the directory
+containing `models/`.
+
+For the Mamba-2 hybrid experiments, see
+[`docs/MAMBA2_HYBRID_EXPERIMENT.md`](docs/MAMBA2_HYBRID_EXPERIMENT.md).
+
+To verify the pinned revision if Git metadata is available:
 
 ```bash
-git submodule update --init --recursive external/TinyRecursiveModels
+cat external/TinyRecursiveModels.upstream.json
 ```
 
 For offline Kaggle runs, attach the same pinned checkout as a Kaggle Dataset
 and set `TRM_UPSTREAM_ROOT` to the mounted directory containing `models/` before
-running the scripts. This avoids requiring a submodule fetch from the notebook.
+running the scripts.
 
 The project-side `build_trm(..., operator="attention")` factory preserves the
 upstream attention baseline. The optional `mamba2_attention` hybrid can be
@@ -38,14 +47,11 @@ python -m pytest -q
 For the offline Kaggle Mamba wheel procedure and manual GPU validation scripts,
 see [`docs/KAGGLE_MAMBA_INSTALL.md`](docs/KAGGLE_MAMBA_INSTALL.md).
 
-Build arrays from an attached ARC Prize 2026 dataset without copying or
-renaming the competition JSON files:
+Build the task-level-split dataset from the public training files:
 
 ```bash
 python scripts/build_arc_agi2_from_kaggle.py \
   --source-dir /kaggle/input/competitions/arc-prize-2026-arc-agi-2 \
-  --output-dir /kaggle/working/data/arc2-aug-1000
+  --output-dir /kaggle/working/data/arc2-mamba2-aug1000 \
+  --num-aug 1000 --validation-tasks 100 --seed 42
 ```
-
-Add `--concept-dir PATH` only when an explicitly approved offline ConceptARC
-source is attached. The competition data itself does not contain ConceptARC.

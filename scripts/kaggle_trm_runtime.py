@@ -24,10 +24,9 @@ if not all(
     )
 ):
     raise FileNotFoundError(
-        f"TinyRecursiveModels source not found at {UPSTREAM_ROOT}. The project pins "
-        "it as a Git submodule; initialize it with `git submodule update --init "
-        "--recursive external/TinyRecursiveModels`, or attach the pinned checkout "
-        "as Kaggle input and set TRM_UPSTREAM_ROOT to its mounted path."
+        f"TinyRecursiveModels source not found at {UPSTREAM_ROOT}. Use the checked-in "
+        "external/TinyRecursiveModels tree or attach the pinned source as Kaggle input "
+        "and set TRM_UPSTREAM_ROOT to the mounted directory."
     )
 for import_path in (
     PROJECT_ROOT / "src",

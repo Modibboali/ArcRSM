@@ -2,7 +2,7 @@
 
 ## Repository integration
 
-The official archived repository is pinned as a Git submodule at
+The official archived source snapshot is stored at
 `external/TinyRecursiveModels/` and remains unmodified.
 
 | Item | Value |
@@ -14,7 +14,10 @@ The official archived repository is pinned as a Git submodule at
 | License | MIT, copyright Samsung Electronics Co., Ltd.; upstream `LICENSE` retained |
 | Baseline policy | No changes inside the checkout; variants live in project-owned code |
 
-The machine-readable pin is `external/TinyRecursiveModels.upstream.json`.
+The machine-readable pin is `external/TinyRecursiveModels.upstream.json`. In the
+current Git index the `external/` files are tracked individually. A separate
+`trm-temp` gitlink exists without a `.gitmodules` mapping, so
+`git submodule status` fails. This pre-existing mismatch was not changed.
 Generated datasets, checkpoints, environments, caches, and submissions are
 ignored at the project root.
 
@@ -37,11 +40,10 @@ Relevant upstream implementation files:
 - `evaluators/arc.py`: token decoding, inverse augmentation, voting,
   pass@K, and submission generation.
 
-Project-owned files intended for later modification are
-`src/arc_agi_trm/` (factory and future variants), not the upstream files. The
-factory exposes `operator="attention"` now and rejects every unimplemented
-operator. The future hybrid should add a project-owned block/reasoning module
-and select it there.
+Project-owned variants live in `src/arc_agi_trm/`; the vendored TRM source is
+not modified. The factory supports `operator="attention"` and the project-owned
+`operator="mamba2_attention"` hybrid, and explicitly rejects the unimplemented
+2D SSM option.
 
 ## Call graph
 
@@ -228,7 +230,7 @@ predictions, so repeated evaluator calls on the same object accumulate votes
 across evaluation checkpoints. This behavior is preserved and should be made
 an explicit experimental choice later.
 
-## ARC Prize 2026 file-layout adapter
+## ARC Prize 2026 dataset preparation
 
 Upstream expects a prefix plus legacy subset names, for example:
 
@@ -260,22 +262,28 @@ Some interactive sessions expose the competition at the older short mount
 the adapter. The hidden test challenges have no solutions and are swapped at
 submission rerun. ConceptARC is not part of the competition attachment.
 
-`scripts/build_arc_agi2_from_kaggle.py` creates temporary links mapping
-`training -> training2` and `evaluation -> evaluation2`, then delegates to the
-unmodified upstream builder. It never copies or rewrites raw JSON and refuses
-to overwrite a non-empty output directory. The adapter deliberately does not
-pretend hidden test dummy labels are ground truth; submission-time inference
-will need a separate wrapper around the attached test challenges/checkpoint.
+The experiment builder in `scripts/build_arc_agi2_from_kaggle.py` reads only the
+public `training_challenges` and `training_solutions` files. It creates a
+deterministic 900-task training / 100-task validation split at the original
+task level, uses the upstream augmentation functions for training, and writes
+memory-mapped-compatible arrays incrementally. It never reads public evaluation
+or private test files. See
+[`MAMBA2_HYBRID_EXPERIMENT.md`](MAMBA2_HYBRID_EXPERIMENT.md) for exact counts,
+sampler policy, and commands.
 
 ## Checkpoints and distributed execution
 
-Checkpoint saving writes only `model.state_dict()` to `step_N`; optimizer,
-scheduler, RNG, carry, epoch, and dataloader state are not saved. Loading is
+The upstream `pretrain.py` saves only `model.state_dict()` to `step_N`; optimizer,
+scheduler, RNG, carry, epoch, and dataloader state are not saved. The project
+Mamba-2 experiment runner uses its own complete checkpoint format; optimizer,
+scheduler step/horizon, per-rank RNG, sampler iteration, epoch, and TRM carry
+are included. Loading upstream checkpoints is
 hard-coded to `map_location="cuda"`, uses `assign=True`, and only resizes the
 puzzle embedding for the compiled key
 `_orig_mod.model.inner.puzzle_emb.weights`. Resume is therefore weight loading,
 not exact training continuation, and compiled/uncompiled key layouts require
-care.
+care. The project runner saves uncompiled strict model keys and rejects a
+resume with a mismatched run fingerprint.
 
 Multi-GPU execution is torch.distributed data parallelism implemented manually,
 not `DistributedDataParallel`:
@@ -322,12 +330,13 @@ bfloat16 and SM 8.9, but the paper's ARC runs used four 80 GiB H100s, not four
 23 GiB L4s. The upstream global batch 768 means local batch 192 on four GPUs and
 may not fit unchanged.
 
-At the theoretical maximum of 1,000 unique augmentations plus each original
-for 1,280 tasks, the sparse puzzle table has 1,281,281 rows. At 512 float32
-values per row it occupies about 2.44 GiB per process/GPU before other model,
-activation, and optimizer memory. Full augmented input/label arrays are also
-large. These are capacity warnings, not authorization to change baseline batch,
-representation, augmentation, or recursion in this phase.
+For the new 900/100 split, if all 900 training tasks reach the requested 1,000
+unique variants, the puzzle table has up to 901,001 rows including 100
+unaugmented validation IDs and the blank row. At 512 float32 values per row it
+occupies about 1.72 GiB per process/GPU before other model, activation, and
+optimizer memory. The streamed input/label arrays can also require several
+GiB on disk. The configured global batch is 32 (8 per device on four L4s), but
+the full hybrid's L4 memory use has not been measured.
 
 See `docs/DEPENDENCY_COMPATIBILITY.md` for package-specific findings.
 
@@ -350,11 +359,12 @@ residual semantics, and the upstream `cos_sin` call contract. Its Mamba import
 is lazy. `FakeMamba2` is injected only in CPU architecture tests; it is not a
 Mamba implementation and provides no evidence about CUDA kernels.
 
-## Verification performed
+## Historical baseline verification
 
 On Windows CPU, Python 3.12.13 and PyTorch 2.10.0+cpu:
 
-- `.venv/Scripts/python.exe -m pytest -q`: 12 tests passed in 22.79 seconds.
+- `.venv/Scripts/python.exe -m pytest -q`: the original 12 baseline tests
+  passed in 22.79 seconds before the experiment pipeline was added.
   Coverage includes the attention baseline, carries and exact grad/no-grad
   recursion schedule; hybrid float32/bfloat16 block shape/dtype/device and
   backward; all fake Mamba parameters receiving gradients and expected
@@ -369,8 +379,10 @@ On Windows CPU, Python 3.12.13 and PyTorch 2.10.0+cpu:
 
 Not verified: real `mamba-ssm` or `causal-conv1d` import, CUDA forward/backward,
 PyTorch CUDA build 2.10.0+cu128, `torch.compile`, Mamba hybrid execution,
-memory/performance, or multi-GPU behavior. Use
+memory/performance, or multi-GPU behavior. The current experiment tests and
+their CPU-only scope are reported in
+[`MAMBA2_HYBRID_EXPERIMENT.md`](MAMBA2_HYBRID_EXPERIMENT.md). Use
 [`KAGGLE_MAMBA_INSTALL.md`](KAGGLE_MAMBA_INSTALL.md) and the qualification
 script on the actual four-L4 Kaggle image before drawing conclusions about
-real Mamba/CUDA correctness or performance. Full training and experimental
-2D SSM remain out of scope.
+real Mamba/CUDA correctness or performance. No full training run is claimed;
+the experimental 2D SSM remains unimplemented.

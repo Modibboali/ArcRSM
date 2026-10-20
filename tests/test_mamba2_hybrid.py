@@ -26,13 +26,17 @@ class FakeMamba2(nn.Module):
         d_state: int,
         headdim: int,
         expand: int,
+        d_conv: int = 4,
         dtype: torch.dtype = torch.float32,
+        **mamba_kwargs,
     ) -> None:
         super().__init__()
         self.d_model = d_model
         self.d_state = d_state
         self.headdim = headdim
         self.expand = expand
+        self.d_conv = d_conv
+        self.mamba_kwargs = mamba_kwargs
         inner = d_model * expand
         self.in_proj = nn.Linear(d_model, inner, dtype=dtype)
         self.out_proj = nn.Linear(inner, d_model, dtype=dtype)
@@ -76,11 +80,17 @@ def test_hybrid_block_preserves_shape_dtype_device_and_backpropagates(
     assert output.device == hidden_states.device
     output.square().mean().backward()
     assert all(parameter.grad is not None for parameter in block.parameters())
-    assert (block.mamba1.d_state, block.mamba1.headdim, block.mamba1.expand) == (4, 8, 2)
+    assert (
+        block.mamba1.d_state,
+        block.mamba1.headdim,
+        block.mamba1.expand,
+        block.mamba1.d_conv,
+    ) == (4, 8, 2, 4)
 
 
 def test_full_hybrid_trm_keeps_recursion_heads_loss_and_gradients() -> None:
     model = build_trm(_hybrid_config(), operator="mamba2_attention", mamba_cls=FakeMamba2)
+    assert isinstance(model.inner.L_level.layers[0], Mamba2AttentionBlock)
     loss_model = ACTLossHead(model, loss_type="stablemax_cross_entropy")
     batch = synthetic_batch()
     carry = loss_model.initial_carry(batch)
@@ -119,6 +129,7 @@ def test_full_hybrid_trm_keeps_recursion_heads_loss_and_gradients() -> None:
         assert all(torch.isfinite(parameter.grad).all() for parameter in mamba.parameters())
     assert model.inner.lm_head.weight.grad is not None
     assert model.inner.q_head.weight.grad is not None
+    assert block.self_attn.qkv_proj.weight.grad is not None
 
 
 def test_missing_mamba_dependency_has_actionable_error(monkeypatch) -> None:
@@ -139,7 +150,7 @@ def test_missing_mamba_dependency_has_actionable_error(monkeypatch) -> None:
 def test_missing_upstream_source_has_submodule_setup_hint(tmp_path, monkeypatch) -> None:
     monkeypatch.setenv("TRM_UPSTREAM_ROOT", str(tmp_path / "not-present"))
 
-    with pytest.raises(FileNotFoundError, match="git submodule update --init"):
+    with pytest.raises(FileNotFoundError, match="TRM_UPSTREAM_ROOT"):
         build_trm(tiny_config())
 
 

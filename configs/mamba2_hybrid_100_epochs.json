@@ -1,0 +1,6 @@
+{
+  "base": "mamba2_hybrid_base.json",
+  "name": "mamba2-hybrid-100",
+  "epochs": 100,
+  "run_dir": "outputs/mamba2-hybrid-100"
+}

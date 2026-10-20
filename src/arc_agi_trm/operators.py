@@ -27,10 +27,8 @@ def _load_upstream_components():
     root = _upstream_root()
     if not (root / "models" / "layers.py").is_file():
         raise FileNotFoundError(
-            f"TinyRecursiveModels source not found at {root}. Initialize the pinned "
-            "submodule with `git submodule update --init --recursive "
-            "external/TinyRecursiveModels`, or set TRM_UPSTREAM_ROOT to an attached "
-            "copy of the pinned checkout."
+            f"TinyRecursiveModels source not found at {root}. Set TRM_UPSTREAM_ROOT "
+            "to an attached copy of the pinned source, at the directory containing models/."
         )
     root_text = str(root)
     if root_text not in sys.path:
@@ -72,6 +70,15 @@ class Mamba2AttentionBlock(nn.Module):
         d_state: int = 128,
         headdim: int = 64,
         expand: int = 2,
+        d_conv: int = 4,
+        d_ssm: int | None = None,
+        ngroups: int = 1,
+        rmsnorm: bool = True,
+        norm_before_gate: bool = False,
+        chunk_size: int = 256,
+        use_mem_eff_path: bool = True,
+        bias: bool = False,
+        conv_bias: bool = True,
     ) -> None:
         super().__init__()
         Attention, SwiGLU, rms_norm = _load_upstream_components()
@@ -83,8 +90,10 @@ class Mamba2AttentionBlock(nn.Module):
             raise ValueError(
                 f"hidden_size ({self.hidden_size}) must be divisible by Mamba headdim ({headdim})"
             )
-        if d_state <= 0 or headdim <= 0 or expand <= 0:
-            raise ValueError("Mamba d_state, headdim, and expand must all be positive")
+        if d_state <= 0 or headdim <= 0 or expand <= 0 or d_conv <= 0 or ngroups <= 0:
+            raise ValueError("Mamba state, head, expansion, convolution, and group sizes must be positive")
+        if chunk_size <= 0:
+            raise ValueError("Mamba chunk_size must be positive")
 
         if mamba_cls is None:
             mamba_cls = load_mamba2_class()
@@ -93,6 +102,15 @@ class Mamba2AttentionBlock(nn.Module):
             "d_state": d_state,
             "headdim": headdim,
             "expand": expand,
+            "d_conv": d_conv,
+            "d_ssm": d_ssm,
+            "ngroups": ngroups,
+            "rmsnorm": rmsnorm,
+            "norm_before_gate": norm_before_gate,
+            "chunk_size": chunk_size,
+            "use_mem_eff_path": use_mem_eff_path,
+            "bias": bias,
+            "conv_bias": conv_bias,
             "dtype": self.forward_dtype,
         }
         self.mamba1 = mamba_cls(**mamba_kwargs)

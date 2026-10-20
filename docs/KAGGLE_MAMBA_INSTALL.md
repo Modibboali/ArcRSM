@@ -8,15 +8,11 @@ requirements, not evidence that the wheels have been tested in this workspace.
 
 ## Make the pinned TRM source available
 
-This project records the unmodified upstream TRM checkout as a Git submodule.
-For an online clone, initialize it with:
-
-```bash
-git submodule update --init --recursive external/TinyRecursiveModels
-```
-
-Because Kaggle runs without internet, ensure that pinned source is already
-available in the notebook image or attach it as a Kaggle Dataset. The mounted
+The repository includes the unmodified source under
+`external/TinyRecursiveModels/` as individually tracked files. Its Git index
+also has an unmatched `trm-temp` gitlink and no `.gitmodules` mapping; this
+pre-existing metadata is not needed by these scripts. If Kaggle does not use
+the checked-in tree, attach the pinned source as a dataset. The mounted
 directory must contain `models/losses.py` and
 `models/recursive_reasoning/trm.py`. If it is mounted at
 `/kaggle/input/trm-upstream/TinyRecursiveModels`, set this before running the

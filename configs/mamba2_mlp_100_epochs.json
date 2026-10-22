@@ -1,0 +1,6 @@
+{
+  "base": "mamba2_mlp_base.json",
+  "name": "mamba2-mlp-100",
+  "epochs": 100,
+  "run_dir": "outputs/mamba2-mlp-100"
+}

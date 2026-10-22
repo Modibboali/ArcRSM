@@ -14,7 +14,7 @@ PyTorch 2.10.0+cpu, einops 0.8.1, pydantic 2.11.7, pydantic-core 2.33.2,
 argdantic 1.3.3, numba 0.61.2, and NumPy 2.2.6. It did not modify a system or
 Kaggle installation.
 
-The optional `mamba2_attention` operator additionally targets
+The optional `mamba2_attention` and `mamba2_mlp` operators additionally target
 `mamba-ssm==2.3.2.post1` and `causal-conv1d==1.6.2.post1` as Linux x86_64,
 CPython 3.12 wheels built for PyTorch 2.10 / CUDA 12.x with CXX11 ABI `TRUE`.
 These extensions were not installed or exercised locally. See
@@ -28,8 +28,8 @@ install order, qualification, and benchmark commands.
 | Python | README says 3.10 or similar | 3.12.13 | all paths | Local tests pass on 3.12.13. | None; use Kaggle Python. |
 | torch | 2.7.0+cu126 | 2.10.0+cu128 | model, train, eval | The pin is incompatible with the requirement not to replace the Kaggle stack. Direct model/loss/backward tests pass on 2.10.0 CPU. CUDA/compile remains unverified. | Do not install or vendor the upstream torch pin. |
 | triton | 3.3.0 | 3.6.0 | indirect through PyTorch compilation | Directly pinning 3.3.0 risks breaking the PyTorch 2.10 pairing. The repo never imports Triton itself. | Do not install; keep Kaggle 3.6.0. |
-| mamba-ssm | not upstream | 2.3.2.post1 (intended) | `mamba2_attention` operator only | CUDA extension; neither import nor kernels have been validated against Kaggle's actual image. | Attach a target-matched wheel; install after `causal-conv1d` with `--no-index --no-deps`. |
-| causal-conv1d | not upstream | 1.6.2.post1 (intended) | required by Mamba-2 | CUDA extension; target wheel compatibility remains unverified until Kaggle qualification. | Install target-matched wheel first with `--no-index --no-deps`. |
+| mamba-ssm | not upstream | 2.3.2.post1 (intended) | both Mamba-2 operators | CUDA extension; neither import nor kernels have been validated against Kaggle's actual image. | Attach a target-matched wheel; install after `causal-conv1d` with `--no-index --no-deps`. |
+| causal-conv1d | not upstream | 1.6.2.post1 (intended) | required by both Mamba-2 operators | CUDA extension; target wheel compatibility remains unverified until Kaggle qualification. | Install target-matched wheel first with `--no-index --no-deps`. |
 | adam-atan2 | 0.0.3 | inventory required | training only | Source-only CUDA extension. Its setup explicitly emits SM 8.9 code, so L4 is listed, but the extension must still be compiled and tested against PyTorch 2.10/CUDA 12.8. A normal isolated build can silently omit the backend and then fail at import. | Vendor the sdist plus build tools; install with `--no-build-isolation` after torch is available, or prebuild on an ABI-matched image. High-priority target test. |
 | einops | 0.8.1 | inventory required | attention reshaping | Pure Python; local model tests pass. | Vendor wheel if absent. |
 | pydantic / pydantic-core | 2.11.7 / 2.33.2 | inventory required | configs and metadata | CPython 3.12 compatible; local tests pass. Keep the matched pair. | Vendor wheels if absent/mismatched. |

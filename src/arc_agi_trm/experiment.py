@@ -114,6 +114,10 @@ def checkpoint_fingerprint(config: Mapping[str, Any]) -> str:
         key: config[key]
         for key in ("operator", "seed", "epochs", "data", "model", "optimization", "run")
     }
+    stable["model"] = dict(stable["model"])
+    # The local sparse-embedding buffers use batch size, but it is not a learned
+    # model shape and can differ between training and standalone evaluation.
+    stable["model"].pop("batch_size", None)
     stable["dataset_manifest_fingerprint"] = config.get("dataset_manifest_fingerprint")
     return hashlib.sha256(
         json.dumps(stable, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -354,4 +358,18 @@ def exact_task_metrics(
         "grid_examples": total_grids,
         "grid_examples_solved": correct_grids,
     }
+
+
+def validation_improved(candidate: Mapping[str, Any], best: Mapping[str, Any]) -> bool:
+    """Select by maximum task exact match, then minimum validation loss."""
+
+    if not best:
+        return True
+    candidate_score = float(candidate["validation_task_exact_match"])
+    best_score = float(best.get("validation_task_exact_match", -1.0))
+    candidate_loss = float(candidate["validation_loss"])
+    best_loss = float(best.get("validation_loss", float("inf")))
+    return candidate_score > best_score or (
+        candidate_score == best_score and candidate_loss < best_loss
+    )
 

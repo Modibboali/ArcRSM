@@ -147,7 +147,7 @@ def create_loaders(
     return train_loader, train_dataset, validation_loader, validation_dataset
 
 
-def create_hybrid_model(
+def create_experiment_model(
     config: Mapping[str, Any],
     metadata,
     *,
@@ -173,25 +173,44 @@ def create_hybrid_model(
         )
         loss_model = ACTLossHead(trm, loss_type="stablemax_cross_entropy")
 
-    if config["operator"] != "mamba2_attention":
-        raise ValueError("This experiment preset must select mamba2_attention")
-    from .operators import Mamba2AttentionBlock
-
+    operator = str(config["operator"])
     layers = trm.inner.L_level.layers
-    if len(layers) != int(model_config["L_layers"]) or any(
-        not isinstance(layer, Mamba2AttentionBlock) for layer in layers
-    ):
-        raise RuntimeError("Model factory did not install the configured Mamba-2 hybrid blocks")
-    parameter_ids = {id(parameter) for parameter in loss_model.parameters()}
-    expected_mamba_parameters = {
-        id(parameter)
-        for layer in layers
-        for mamba in (layer.mamba1, layer.mamba2)
-        for parameter in mamba.parameters()
-    }
-    if not expected_mamba_parameters.issubset(parameter_ids):
-        raise RuntimeError("One or more Mamba-2 parameters are absent from model.parameters()")
+    if len(layers) != int(model_config["L_layers"]):
+        raise RuntimeError("Model factory installed an unexpected number of shared TRM blocks")
+    if operator == "mamba2_attention":
+        from .operators import Mamba2AttentionBlock
+
+        expected_cls = Mamba2AttentionBlock
+    elif operator == "mamba2_mlp":
+        from .operators import Mamba2MLPBlock
+
+        expected_cls = Mamba2MLPBlock
+    else:
+        expected_cls = None
+    if expected_cls is not None:
+        if any(not isinstance(layer, expected_cls) for layer in layers):
+            raise RuntimeError(f"Model factory did not install the configured {operator} blocks")
+        parameter_ids = {id(parameter) for parameter in loss_model.parameters()}
+        mamba_modules = [
+            getattr(layer, "mamba", None)
+            for layer in layers
+        ] if operator == "mamba2_mlp" else [
+            mamba
+            for layer in layers
+            for mamba in (layer.mamba1, layer.mamba2)
+        ]
+        expected_mamba_parameters = {
+            id(parameter)
+            for mamba in mamba_modules
+            for parameter in mamba.parameters()
+        }
+        if not expected_mamba_parameters or not expected_mamba_parameters.issubset(parameter_ids):
+            raise RuntimeError("One or more Mamba-2 parameters are absent from model.parameters()")
     return loss_model
+
+
+# Kept for existing experiment scripts and tests.
+create_hybrid_model = create_experiment_model
 
 
 def create_optimizers(
@@ -355,7 +374,7 @@ def evaluate_validation(
                 local["predictions"].append((task_id, input_hash, output_hash))
             del carry, batch, outputs
 
-    if torch.cuda.is_available():
+    if device.type == "cuda" and torch.cuda.is_available():
         torch.cuda.synchronize(device)
     local["seconds"] = time.perf_counter() - start
     if model_was_training:

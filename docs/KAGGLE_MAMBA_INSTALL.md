@@ -65,8 +65,8 @@ the attached wheelhouse for the target ABI.
 
 ## Qualify before benchmarking
 
-Run the required environment, dependency, standalone Mamba, attention TRM, and
-hybrid TRM checks first:
+Run the required environment, dependency, standalone Mamba, attention TRM,
+Mamba-2 + attention TRM, and Mamba-2 + MLP TRM checks first:
 
 ```bash
 python scripts/kaggle_gpu_qualification.py --batch-size 1

@@ -77,6 +77,15 @@ def make_config(
         "mamba_d_state": mamba_d_state,
         "mamba_headdim": mamba_headdim,
         "mamba_expand": mamba_expand,
+        "mamba_d_conv": 4,
+        "mamba_d_ssm": None,
+        "mamba_ngroups": 1,
+        "mamba_rmsnorm": True,
+        "mamba_norm_before_gate": False,
+        "mamba_chunk_size": 256,
+        "mamba_use_mem_eff_path": True,
+        "mamba_bias": False,
+        "mamba_conv_bias": True,
     }
 
 

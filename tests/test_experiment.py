@@ -15,7 +15,9 @@ from arc_agi_trm.experiment import (
     load_experiment_config,
     seed_training_rank,
     train_one_epoch,
+    validation_improved,
 )
+from arc_agi_trm.checkpoints import load_checkpoint
 from arc_agi_trm.runner import (
     create_hybrid_model,
     create_loaders,
@@ -300,6 +302,69 @@ def test_checkpoint_roundtrip_restores_optimizer_rng_carry_and_epoch(tmp_path) -
                 assert torch.equal(value.cpu(), saved_value)
             else:
                 assert value == saved_value
+
+    _save_checkpoint(
+        run_dir=tmp_path,
+        model=model,
+        optimizers=optimizers,
+        config=config,
+        epoch=3,
+        optimizer_step=trained.optimizer_step,
+        best_metrics=best,
+        train_dataset=dataset,
+        carry=trained.carry,
+        rank=0,
+        world_size=1,
+        cpu_group=None,
+        timing_summary={"epoch_duration_sum": 13.0, "epoch_duration_count": 3},
+        is_best=False,
+    )
+    latest = torch.load(tmp_path / "latest.pt", map_location="cpu", weights_only=False)
+    best_saved = torch.load(tmp_path / "best.pt", map_location="cpu", weights_only=False)
+    assert latest["completed_epochs"] == 3
+    assert best_saved["completed_epochs"] == 2
+    for key, value in saved["model"].items():
+        assert torch.equal(best_saved["model"][key], value)
+
+    incomplete_path = tmp_path / "incomplete.pt"
+    incomplete = dict(latest)
+    incomplete.pop("optimizers")
+    torch.save(incomplete, incomplete_path)
+    untouched_model, untouched_optimizers, _ = _model_and_optimizers(config)
+    with pytest.raises(ValueError, match="missing required state: optimizers"):
+        _load_resume(
+            path=incomplete_path,
+            model=untouched_model,
+            optimizers=untouched_optimizers,
+            config=config,
+            train_dataset=DatasetState(),
+            rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+
+
+def test_best_model_selection_maximizes_task_accuracy_then_minimizes_loss() -> None:
+    best = {"validation_task_exact_match": 0.5, "validation_loss": 1.0}
+    assert validation_improved(
+        {"validation_task_exact_match": 0.75, "validation_loss": 1.4}, best
+    )
+    assert validation_improved(
+        {"validation_task_exact_match": 0.5, "validation_loss": 0.9}, best
+    )
+    assert not validation_improved(
+        {"validation_task_exact_match": 0.25, "validation_loss": 0.1}, best
+    )
+    assert not validation_improved(
+        {"validation_task_exact_match": 0.5, "validation_loss": 1.0}, best
+    )
+
+
+def test_corrupted_full_checkpoint_fails_clearly(tmp_path) -> None:
+    path = tmp_path / "corrupt.pt"
+    path.write_bytes(b"not a pytorch checkpoint")
+    with pytest.raises(ValueError, match="Could not read trusted training checkpoint"):
+        load_checkpoint(path, trusted=True)
 
 
 def test_task_metric_requires_every_test_input_to_match() -> None:

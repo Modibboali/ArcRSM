@@ -297,9 +297,17 @@ def main() -> int:
                 lambda: trm_cuda_test("mamba2_attention", config, batch, device, report),
                 required=True,
             )
+            mlp_result = report.run(
+                "F_mamba2_mlp_trm",
+                lambda: trm_cuda_test("mamba2_mlp", config, batch, device, report),
+                required=True,
+            )
         else:
             hybrid_result = report.run(
                 "E_mamba2_attention_trm", None, required=True, skip_reason="Mamba dependencies failed"
+            )
+            mlp_result = report.run(
+                "F_mamba2_mlp_trm", None, required=True, skip_reason="Mamba dependencies failed"
             )
     else:
         attention_result = report.run(
@@ -308,39 +316,51 @@ def main() -> int:
         hybrid_result = report.run(
             "E_mamba2_attention_trm", None, required=True, skip_reason="CUDA environment failed"
         )
+        mlp_result = report.run(
+            "F_mamba2_mlp_trm", None, required=True, skip_reason="CUDA environment failed"
+        )
         config = None
         batch = None
 
-    if attention_result is not None and hybrid_result is not None:
-        report.run("F_peak_memory", lambda: report.memory, required=True)
+    if attention_result is not None and hybrid_result is not None and mlp_result is not None:
+        report.run("G_peak_memory", lambda: report.memory, required=True)
     else:
         report.run(
-            "F_peak_memory",
+            "G_peak_memory",
             None,
             required=True,
-            skip_reason="Both eager TRM runs must pass to compare memory",
+            skip_reason="All three eager TRM runs must pass to compare memory",
         )
 
     if args.compile and report.cuda_ok and config is not None and batch is not None:
         report.run(
-            "G_compile_attention",
+            "H_compile_attention",
             lambda: compile_test("attention", config, batch, device),
             required=False,
         )
         if report.dependencies_ok:
             report.run(
-                "G_compile_mamba2_attention",
+                "H_compile_mamba2_attention",
                 lambda: compile_test("mamba2_attention", config, batch, device),
+                required=False,
+            )
+            report.run(
+                "H_compile_mamba2_mlp",
+                lambda: compile_test("mamba2_mlp", config, batch, device),
                 required=False,
             )
         else:
             report.run(
-                "G_compile_mamba2_attention", None, required=False, skip_reason="Mamba dependencies failed"
+                "H_compile_mamba2_attention", None, required=False, skip_reason="Mamba dependencies failed"
+            )
+            report.run(
+                "H_compile_mamba2_mlp", None, required=False, skip_reason="Mamba dependencies failed"
             )
     else:
         reason = "pass --compile to run the optional compile tests"
-        report.run("G_compile_attention", None, required=False, skip_reason=reason)
-        report.run("G_compile_mamba2_attention", None, required=False, skip_reason=reason)
+        report.run("H_compile_attention", None, required=False, skip_reason=reason)
+        report.run("H_compile_mamba2_attention", None, required=False, skip_reason=reason)
+        report.run("H_compile_mamba2_mlp", None, required=False, skip_reason=reason)
 
     final = {
         "qualification": "FAIL" if report.required_failure else "PASS",

@@ -8,7 +8,27 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-SUPPORTED_OPERATORS = ("attention", "mamba2_attention", "experimental_2d_ssm")
+SUPPORTED_OPERATORS = (
+    "attention",
+    "mamba2_attention",
+    "mamba2_mlp",
+    "experimental_2d_ssm",
+)
+
+_MAMBA_REQUIRED_CONFIG = (
+    "mamba_d_state",
+    "mamba_headdim",
+    "mamba_expand",
+    "mamba_d_conv",
+    "mamba_d_ssm",
+    "mamba_ngroups",
+    "mamba_rmsnorm",
+    "mamba_norm_before_gate",
+    "mamba_chunk_size",
+    "mamba_use_mem_eff_path",
+    "mamba_bias",
+    "mamba_conv_bias",
+)
 
 
 def upstream_root() -> Path:
@@ -54,7 +74,19 @@ def build_trm(
         raise NotImplementedError(
             "operator='experimental_2d_ssm' is reserved and has not been implemented"
         )
+    if operator == "mamba2_mlp":
+        missing = [key for key in _MAMBA_REQUIRED_CONFIG if key not in config]
+        if missing:
+            raise ValueError(
+                "operator='mamba2_mlp' is missing Mamba-2 configuration value(s): "
+                + ", ".join(missing)
+                + ". Add the qualified mamba_* settings to the model config."
+            )
     model = _load_model_class()(dict(config))
+    model._arc_agi_trm_metadata = {  # type: ignore[attr-defined]
+        "operator": operator,
+        "model": dict(config),
+    }
     if operator == "attention":
         return model
 
@@ -63,7 +95,14 @@ def build_trm(
             f"operator={operator!r} requires the attention-mixer TRM setting mlp_t=False"
         )
 
-    from .operators import Mamba2AttentionBlock
+    if operator == "mamba2_attention":
+        from .operators import Mamba2AttentionBlock
+
+        block_cls = Mamba2AttentionBlock
+    else:
+        from .operators import Mamba2MLPBlock
+
+        block_cls = Mamba2MLPBlock
 
     hidden_config = model.config
     mamba_config = {
@@ -82,7 +121,7 @@ def build_trm(
     }
     model.inner.L_level.layers = model.inner.L_level.layers.__class__(
         [
-            Mamba2AttentionBlock(
+            block_cls(
                 hidden_config,
                 mamba_cls=mamba_cls,
                 **mamba_config,
@@ -91,7 +130,7 @@ def build_trm(
         ]
     )
     if len(model.inner.L_level.layers) != hidden_config.L_layers or any(
-        not isinstance(layer, Mamba2AttentionBlock)
+        not isinstance(layer, block_cls)
         for layer in model.inner.L_level.layers
     ):
         raise RuntimeError("Mamba-2 hybrid block installation did not complete")

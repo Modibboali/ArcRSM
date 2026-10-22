@@ -41,9 +41,9 @@ Relevant upstream implementation files:
   pass@K, and submission generation.
 
 Project-owned variants live in `src/arc_agi_trm/`; the vendored TRM source is
-not modified. The factory supports `operator="attention"` and the project-owned
-`operator="mamba2_attention"` hybrid, and explicitly rejects the unimplemented
-2D SSM option.
+not modified. The factory supports the upstream `operator="attention"` and the
+project-owned `operator="mamba2_attention"` and `operator="mamba2_mlp"`
+variants, and explicitly rejects the unimplemented 2D SSM option.
 
 ## Call graph
 
@@ -351,6 +351,7 @@ The project-owned factory supports:
 ```text
 operator=attention          -> exact upstream block
 operator=mamba2_attention   -> Mamba2 -> Mamba2 -> non-causal Attention -> MLP block
+operator=mamba2_mlp         -> pre-norm Mamba2 -> pre-norm SwiGLU MLP block
 operator=experimental_2d_ssm -> explicitly unimplemented
 ```
 
@@ -358,6 +359,14 @@ The hybrid preserves `[B,S+P,D] -> [B,S+P,D]`, dtype/device, post-norm
 residual semantics, and the upstream `cos_sin` call contract. Its Mamba import
 is lazy. `FakeMamba2` is injected only in CPU architecture tests; it is not a
 Mamba implementation and provides no evidence about CUDA kernels.
+
+`mamba2_mlp` has one Mamba-2 mixer and the vendored SwiGLU implementation, with
+residual additions after each sublayer. It contains no attention. It replaces
+only the same per-step layer list and preserves the upstream `[B,S+P,D]` carry
+shape and recursive call schedule. Its Mamba scan processes the flattened ARC
+sequence in token order; no bidirectional or two-dimensional scan is claimed.
+Model-only and full training checkpoint workflows are described in
+[`MAMBA2_MLP_AND_CHECKPOINTS.md`](MAMBA2_MLP_AND_CHECKPOINTS.md).
 
 ## Historical baseline verification
 

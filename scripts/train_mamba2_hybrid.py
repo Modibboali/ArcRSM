@@ -1,4 +1,4 @@
-"""Train the project-owned Mamba-2 hybrid with the upstream TRM loop."""
+"""Train a project-owned TRM operator with the unchanged upstream TRM loop."""
 
 from __future__ import annotations
 
@@ -34,10 +34,17 @@ from arc_agi_trm.experiment import (  # noqa: E402
     seed_training_rank,
     train_one_epoch,
     tree_map,
+    validation_improved,
+)
+from arc_agi_trm.checkpoints import (  # noqa: E402
+    load_checkpoint as read_training_checkpoint,
+    load_pretrained,
+    save_pretrained,
+    source_revision,
 )
 from arc_agi_trm.runner import (  # noqa: E402
     check_dataset_config,
-    create_hybrid_model,
+    create_experiment_model,
     create_loaders,
     create_optimizers,
     evaluate_validation,
@@ -53,9 +60,9 @@ def _resolve_from_root(path: str | Path) -> Path:
 def _init_distributed():
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "Full Mamba-2 hybrid training requires CUDA and the qualified mamba-ssm/"
-            "causal-conv1d kernels. This environment has no CUDA device; use the CPU "
-            "unit tests and run the training command in the prepared Kaggle image."
+            "This experiment entry point requires CUDA. Mamba-2 operators also require "
+            "the qualified mamba-ssm/causal-conv1d kernels. No CUDA device is available; "
+            "use CPU unit tests and run configured training in the prepared Kaggle image."
         )
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)
@@ -70,18 +77,36 @@ def _init_distributed():
 
 
 def _validate_config(config: dict[str, Any], world_size: int) -> dict[str, int]:
-    if config.get("operator") != "mamba2_attention":
-        raise ValueError("Experiment configuration must set operator=mamba2_attention")
+    operator = config.get("operator")
+    if operator not in {"attention", "mamba2_attention", "mamba2_mlp"}:
+        raise ValueError(
+            "Experiment configuration must set operator to one of: "
+            "attention, mamba2_attention, mamba2_mlp"
+        )
     if int(config.get("epochs", 0)) <= 0:
         raise ValueError("Experiment epochs must be positive")
     if int(config["model"]["hidden_size"]) % int(config["model"]["num_heads"]):
         raise ValueError("hidden_size must be divisible by num_heads")
-    if int(config["model"]["hidden_size"]) % int(config["model"]["mamba_headdim"]):
-        raise ValueError("hidden_size must be divisible by mamba_headdim")
+    if operator.startswith("mamba2_"):
+        if int(config["model"]["hidden_size"]) % int(config["model"].get("mamba_headdim", 0) or 1):
+            raise ValueError("hidden_size must be divisible by mamba_headdim")
+        if operator == "mamba2_mlp":
+            required = (
+                "mamba_d_state", "mamba_headdim", "mamba_expand", "mamba_d_conv",
+                "mamba_d_ssm", "mamba_ngroups", "mamba_rmsnorm",
+                "mamba_norm_before_gate", "mamba_chunk_size",
+                "mamba_use_mem_eff_path", "mamba_bias", "mamba_conv_bias",
+            )
+            missing = [key for key in required if key not in config["model"]]
+            if missing:
+                raise ValueError(
+                    "mamba2_mlp config is missing required Mamba-2 setting(s): "
+                    + ", ".join(missing)
+                )
     if int(config["model"]["L_cycles"]) < 1 or int(config["model"]["H_cycles"]) < 1:
         raise ValueError("TRM recursive cycle counts must be positive")
     if int(config["model"]["L_layers"]) < 1:
-        raise ValueError("The hybrid model requires at least one shared TRM block")
+        raise ValueError("The model requires at least one shared TRM block")
     run_settings = config["run"]
     if int(run_settings.get("num_workers", 0)) != 0:
         raise ValueError(
@@ -96,6 +121,14 @@ def _validate_config(config: dict[str, Any], world_size: int) -> dict[str, int]:
         world_size,
         int(config["optimization"]["gradient_accumulation_steps"]),
     )
+
+
+def _mamba_modules(layer):
+    if hasattr(layer, "mamba"):
+        return (layer.mamba,)
+    if hasattr(layer, "mamba1") and hasattr(layer, "mamba2"):
+        return (layer.mamba1, layer.mamba2)
+    return ()
 
 
 def _atomic_torch_save(payload: Any, destination: Path) -> float:
@@ -124,7 +157,7 @@ def _point_best_at_latest(latest: Path, best: Path) -> None:
     os.replace(temporary, best)
 
 
-def _save_checkpoint(
+def save_checkpoint(
     *,
     run_dir: Path,
     model,
@@ -156,8 +189,18 @@ def _save_checkpoint(
     if rank == 0:
         payload = {
             "format_version": 1,
+            "schema_version": 2,
+            "checkpoint_kind": "arc_agi_trm_training",
+            "architecture": config["operator"],
+            "architecture_hyperparameters": dict(config["model"]),
+            "vocabulary": {
+                "size": config["model"].get("vocab_size"),
+                "output_size": config["model"].get("vocab_size"),
+            },
+            "source_revision": source_revision(),
             "completed_epochs": epoch,
             "optimizer_step": optimizer_step,
+            "global_step": optimizer_step,
             "world_size": world_size,
             "config_fingerprint": checkpoint_fingerprint(config),
             "config": config,
@@ -167,11 +210,14 @@ def _save_checkpoint(
                 for optimizer in optimizers
             ],
             "scheduler": {
+                "kind": "step_derived_warmup_cosine",
                 "step": optimizer_step,
                 "warmup_steps": int(config["optimization"]["lr_warmup_steps"]),
                 "total_steps": max(1, int(config["estimated_total_optimizer_steps"])),
                 "min_lr_ratio": float(config["optimization"]["lr_min_ratio"]),
             },
+            # The training loop currently uses bfloat16 autocast without a GradScaler.
+            "grad_scaler": None,
             "best_validation": best_metrics,
             "timing_summary": timing_summary,
             "rank_runtime": gathered_runtime,
@@ -184,7 +230,10 @@ def _save_checkpoint(
     return elapsed
 
 
-def _load_resume(
+_save_checkpoint = save_checkpoint
+
+
+def resume_training(
     *,
     path: Path,
     model,
@@ -197,9 +246,28 @@ def _load_resume(
 ):
     if not path.is_file():
         raise FileNotFoundError(f"Resume checkpoint does not exist: {path}")
-    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    checkpoint = read_training_checkpoint(path, map_location="cpu", trusted=True)
     if checkpoint.get("format_version") != 1:
         raise ValueError(f"Unsupported checkpoint format in {path}")
+    schema_version = int(checkpoint.get("schema_version", 1))
+    if schema_version not in {1, 2}:
+        raise ValueError(f"Unsupported training checkpoint schema {schema_version} in {path}")
+    required_fields = (
+        "completed_epochs", "optimizer_step", "config", "model", "optimizers",
+        "scheduler", "rank_runtime", "best_validation", "world_size",
+        "config_fingerprint",
+    )
+    missing_fields = [key for key in required_fields if key not in checkpoint]
+    if missing_fields:
+        raise ValueError(
+            "Cannot resume exactly; training checkpoint is missing required state: "
+            + ", ".join(missing_fields)
+        )
+    if schema_version >= 2 and checkpoint.get("architecture") != config.get("operator"):
+        raise ValueError(
+            f"Checkpoint architecture {checkpoint.get('architecture')!r} does not match "
+            f"configured architecture {config.get('operator')!r}"
+        )
     if int(checkpoint["world_size"]) != world_size:
         raise ValueError(
             f"Checkpoint was saved with world_size={checkpoint['world_size']}, "
@@ -219,19 +287,41 @@ def _load_resume(
         "min_lr_ratio": float(config["optimization"]["lr_min_ratio"]),
     }
     saved_scheduler = checkpoint.get("scheduler", {})
+    if schema_version >= 2 and saved_scheduler.get("kind") != "step_derived_warmup_cosine":
+        raise ValueError("Checkpoint uses an unsupported scheduler state format")
     if any(saved_scheduler.get(key) != value for key, value in expected_scheduler.items()):
         raise ValueError(
             "Checkpoint scheduler state does not match the configured warmup, total "
             "step horizon, or minimum learning-rate ratio"
         )
-    model.load_state_dict(checkpoint["model"], strict=True)
+    if schema_version >= 2 and int(checkpoint.get("global_step", -1)) != int(checkpoint["optimizer_step"]):
+        raise ValueError("Checkpoint global_step and optimizer_step are inconsistent")
+    if checkpoint.get("grad_scaler") is not None:
+        raise ValueError("Checkpoint contains GradScaler state but this run has no GradScaler configured")
+    if not isinstance(checkpoint["model"], dict) or not checkpoint["model"]:
+        raise ValueError("Checkpoint has no model state; exact resume is unavailable")
     if len(checkpoint["optimizers"]) != len(optimizers):
         raise ValueError("Checkpoint optimizer count does not match the configured optimizer setup")
-    for optimizer, state in zip(optimizers, checkpoint["optimizers"]):
-        optimizer.load_state_dict(state)
+    if any(not isinstance(state, dict) for state in checkpoint["optimizers"]):
+        raise ValueError("Checkpoint contains a malformed optimizer state")
     if len(checkpoint["rank_runtime"]) != world_size:
         raise ValueError("Checkpoint does not contain RNG/carry state for every rank")
+    if rank < 0 or rank >= len(checkpoint["rank_runtime"]):
+        raise ValueError(f"Checkpoint has no runtime state for rank {rank}")
     runtime = checkpoint["rank_runtime"][rank]
+    if not isinstance(runtime, dict) or not {"rng", "carry", "sampler_iters"}.issubset(runtime):
+        raise ValueError(f"Checkpoint rank {rank} is missing RNG, carry, or sampler state")
+    if not {"python", "numpy", "torch_cpu", "torch_cuda"}.issubset(runtime["rng"]):
+        raise ValueError(f"Checkpoint rank {rank} is missing one or more RNG states")
+    if runtime["rng"]["torch_cuda"] and not torch.cuda.is_available():
+        raise ValueError(
+            "Checkpoint has CUDA RNG state but CUDA is unavailable; exact resume cannot restore it"
+        )
+    if int(checkpoint["completed_epochs"]) > 0 and runtime["carry"] is None:
+        raise ValueError("Checkpoint is missing the TRM carry required to continue the next epoch")
+    model.load_state_dict(checkpoint["model"], strict=True)
+    for optimizer, state in zip(optimizers, checkpoint["optimizers"]):
+        optimizer.load_state_dict(state)
     restore_rng_state(runtime["rng"])
     train_dataset._iters = int(runtime["sampler_iters"])
     carry = tree_map(runtime["carry"], lambda tensor: tensor.to(device))
@@ -242,6 +332,9 @@ def _load_resume(
         checkpoint.get("best_validation", {}),
         checkpoint.get("timing_summary", {"epoch_duration_sum": 0.0, "epoch_duration_count": 0}),
     )
+
+
+_load_resume = resume_training
 
 
 def _reduce_epoch_result(result, device: torch.device, world_size: int):
@@ -294,6 +387,8 @@ def _runtime_environment(device: torch.device, world_size: int) -> dict[str, Any
 
 
 def run(args: argparse.Namespace) -> int:
+    if args.resume and args.init_from:
+        raise ValueError("--resume and --init-from are separate modes; choose only one")
     rank, world_size, _local_rank, cpu_group, device = _init_distributed()
     config = load_experiment_config(args.config)
     config["source_config"] = str(Path(args.config).resolve())
@@ -318,6 +413,12 @@ def run(args: argparse.Namespace) -> int:
             rank=rank,
             world_size=world_size,
         )
+        config["model"].update(
+            batch_size=batch_plan["per_device_batch_size"],
+            seq_len=int(train_dataset.metadata.seq_len),
+            vocab_size=int(train_dataset.metadata.vocab_size),
+            num_puzzle_identifiers=int(train_dataset.metadata.num_puzzle_identifiers),
+        )
         batch_plan["validation_per_device_batch_size"] = validation_dataset.local_batch_size
         examples_per_epoch_estimate = (
             train_dataset.metadata.total_groups * train_dataset.metadata.mean_puzzle_examples
@@ -338,7 +439,7 @@ def run(args: argparse.Namespace) -> int:
         # All workers build identical initial weights; rank-specific RNG streams
         # are installed after construction and restored from rank-local checkpoints.
         seed_everything(int(config["seed"]))
-        loss_model = create_hybrid_model(
+        loss_model = create_experiment_model(
             config,
             train_dataset.metadata,
             per_device_batch_size=batch_plan["per_device_batch_size"],
@@ -353,7 +454,7 @@ def run(args: argparse.Namespace) -> int:
                 resume_path = run_dir / "latest.pt"
             elif resume_path.is_dir():
                 resume_path = resume_path / "latest.pt"
-            completed_epochs, optimizer_step, carry, best_metrics, timing_summary = _load_resume(
+            completed_epochs, optimizer_step, carry, best_metrics, timing_summary = resume_training(
                 path=resume_path.resolve(),
                 model=loss_model,
                 optimizers=optimizers,
@@ -366,6 +467,20 @@ def run(args: argparse.Namespace) -> int:
         else:
             completed_epochs, optimizer_step, carry, best_metrics = 0, 0, None, {}
             timing_summary = {"epoch_duration_sum": 0.0, "epoch_duration_count": 0}
+            if args.init_from:
+                report = load_pretrained(
+                    loss_model,
+                    _resolve_from_root(args.init_from),
+                    device=device,
+                    strict=True,
+                    expected_config=config,
+                )
+                if rank == 0:
+                    print(
+                        "Initialized model weights from pretrained artifact; optimizer and "
+                        f"scheduler start fresh: {report['architecture']}",
+                        flush=True,
+                    )
             seed_training_rank(int(config["seed"]), rank)
 
         if rank == 0:
@@ -383,7 +498,7 @@ def run(args: argparse.Namespace) -> int:
                         "trainable_mamba_parameter_count": sum(
                             parameter.numel()
                             for layer in loss_model.model.inner.L_level.layers
-                            for mamba in (layer.mamba1, layer.mamba2)
+                            for mamba in _mamba_modules(layer)
                             for parameter in mamba.parameters()
                             if parameter.requires_grad
                         ),
@@ -395,12 +510,13 @@ def run(args: argparse.Namespace) -> int:
             with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
                 stream.write(
                     f"Starting {config['name']} at completed_epoch={completed_epochs}, "
-                    f"world_size={world_size}, device={device}, operator={config['operator']}\n"
+                    f"world_size={world_size}, device={device}, architecture={config['operator']}, "
+                    f"model={json.dumps(config['model'], sort_keys=True)}\n"
                 )
                 stream.flush()
 
         if not args.resume:
-            _save_checkpoint(
+            save_checkpoint(
                 run_dir=run_dir,
                 model=loss_model,
                 optimizers=optimizers,
@@ -444,7 +560,7 @@ def run(args: argparse.Namespace) -> int:
             except torch.cuda.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
                 raise RuntimeError(
-                    "CUDA out of memory in Mamba-2 hybrid training at "
+                    f"CUDA out of memory in {config['operator']} training at "
                     f"epoch={epoch}, per_device_batch_size={batch_plan['per_device_batch_size']}, "
                     f"global_batch_size={global_batch_size}, "
                     f"gradient_accumulation_steps={batch_plan['gradient_accumulation_steps']}. "
@@ -485,6 +601,21 @@ def run(args: argparse.Namespace) -> int:
                 else None,
                 "seed": config["seed"],
                 "operator": config["operator"],
+                "architecture": config["operator"],
+                "model_hyperparameters": config["model"],
+                "dataset_split": {
+                    "validation_tasks": int(config["data"]["validation_tasks"]),
+                    "validation_variants_per_task": int(config["data"]["validation_variants_per_task"]),
+                },
+                "augmentation": config["data"],
+                "optimization": config["optimization"],
+                "precision": config["model"].get("forward_dtype"),
+                "checkpoint_paths": {
+                    "latest": str(run_dir / "latest.pt"),
+                    "best": str(run_dir / "best.pt"),
+                    "best_pretrained": str(run_dir / "best_pretrained.pt"),
+                    "final_pretrained": str(run_dir / "final_pretrained.pt"),
+                },
                 "world_size": world_size,
                 "global_batch_size": batch_plan["microbatch_global_size"],
                 "per_device_batch_size": batch_plan["per_device_batch_size"],
@@ -517,17 +648,7 @@ def run(args: argparse.Namespace) -> int:
                 )
                 if rank == 0:
                     previous = best_metrics
-                    improved = (
-                        not previous
-                        or float(validation_metrics["validation_task_exact_match"])
-                        > float(previous.get("validation_task_exact_match", -1.0))
-                        or (
-                            float(validation_metrics["validation_task_exact_match"])
-                            == float(previous.get("validation_task_exact_match", -1.0))
-                            and float(validation_metrics["validation_loss"])
-                            < float(previous.get("validation_loss", math.inf))
-                        )
-                    )
+                    improved = validation_improved(validation_metrics, previous)
                     if improved:
                         best_metrics = dict(validation_metrics)
                         best_metrics["epoch"] = epoch
@@ -558,7 +679,7 @@ def run(args: argparse.Namespace) -> int:
                 or improved
             )
             if should_checkpoint:
-                record["checkpoint_write_seconds"] = _save_checkpoint(
+                record["checkpoint_write_seconds"] = save_checkpoint(
                     run_dir=run_dir,
                     model=loss_model,
                     optimizers=optimizers,
@@ -575,6 +696,18 @@ def run(args: argparse.Namespace) -> int:
                     is_best=improved,
                 )
                 record["checkpoint_path"] = str(run_dir / "latest.pt")
+                if improved and rank == 0:
+                    save_pretrained(
+                        loss_model,
+                        run_dir / "best_pretrained.pt",
+                        config,
+                        metadata={
+                            "epoch": epoch,
+                            "global_step": optimizer_step,
+                            "best_validation": best_metrics,
+                            "experiment_name": config.get("name"),
+                        },
+                    )
             record["peak_gpu_memory_allocated_bytes"] = int(
                 torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
             )
@@ -586,8 +719,20 @@ def run(args: argparse.Namespace) -> int:
                 with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
                 print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
+            completed_epochs = epoch
 
         if rank == 0:
+            save_pretrained(
+                loss_model,
+                run_dir / "final_pretrained.pt",
+                config,
+                metadata={
+                    "completed_epochs": int(config["epochs"]),
+                    "global_step": optimizer_step,
+                    "best_validation": best_metrics,
+                    "experiment_name": config.get("name"),
+                },
+            )
             print(
                 f"Completed {config['epochs']} epochs for {config['name']}; "
                 f"latest={run_dir / 'latest.pt'}, best={run_dir / 'best.pt'}",
@@ -609,6 +754,11 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         const="latest",
         help="Resume from RUN_DIR/latest.pt, a checkpoint file, or a checkpoint directory",
+    )
+    parser.add_argument(
+        "--init-from",
+        type=Path,
+        help="Initialize model weights from a model-only artifact; create fresh optimizer/scheduler state",
     )
     parser.add_argument(
         "--allow-small-dataset",

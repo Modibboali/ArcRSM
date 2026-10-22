@@ -1,4 +1,4 @@
-"""Benchmark attention and Mamba-2 hybrid TRMs on a Kaggle CUDA GPU."""
+"""Benchmark attention, Mamba-2 hybrid, and Mamba-2 + SwiGLU TRMs on CUDA."""
 
 from __future__ import annotations
 
@@ -130,7 +130,7 @@ def main() -> int:
         )
         batch = make_batch(batch_size=args.batch_size, seq_len=args.seq_len, device=device)
         results = {}
-        for operator in ("attention", "mamba2_attention"):
+        for operator in ("attention", "mamba2_attention", "mamba2_mlp"):
             print(f"[RUN] {operator}: batch={args.batch_size}, sequence={args.seq_len}")
             results[operator] = benchmark_operator(
                 operator,

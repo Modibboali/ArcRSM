@@ -19,7 +19,10 @@ repository has a pre-existing unmatched `trm-temp` gitlink without a
 copy of the pinned source and set `TRM_UPSTREAM_ROOT` to the directory
 containing `models/`.
 
-For the Mamba-2 hybrid experiments, see
+For the Mamba-2 + SwiGLU architecture, checkpoint APIs, and training commands,
+see [`docs/MAMBA2_MLP_AND_CHECKPOINTS.md`](docs/MAMBA2_MLP_AND_CHECKPOINTS.md).
+
+For the existing Mamba-2 + attention experiment details, see
 [`docs/MAMBA2_HYBRID_EXPERIMENT.md`](docs/MAMBA2_HYBRID_EXPERIMENT.md).
 
 To verify the pinned revision if Git metadata is available:
@@ -33,10 +36,10 @@ and set `TRM_UPSTREAM_ROOT` to the mounted directory containing `models/` before
 running the scripts.
 
 The project-side `build_trm(..., operator="attention")` factory preserves the
-upstream attention baseline. The optional `mamba2_attention` hybrid can be
-architecture-tested locally with an injected fake mixer; the real CUDA-backed
-Mamba dependency is lazy-loaded and must be qualified in Kaggle. The reserved
-`experimental_2d_ssm` operator is explicitly unimplemented.
+upstream attention baseline. The `mamba2_attention` and `mamba2_mlp` operators
+are project-owned comparisons; Mamba dependencies load lazily and must be
+qualified on the target Kaggle CUDA image. The reserved `experimental_2d_ssm`
+operator is explicitly unimplemented.
 
 Run the CPU smoke suite from the repository root:
 

@@ -13,6 +13,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from .numerics import NumericsDiagnostics
+
 
 def load_experiment_config(path: str | Path) -> dict[str, Any]:
     """Load a run preset layered over the shared Mamba-2 base JSON file."""
@@ -173,6 +175,10 @@ def train_one_epoch(
     gradient_clip_norm: float | None = None,
     rank: int = 0,
     world_size: int = 1,
+    epoch: int = 0,
+    diagnostics: NumericsDiagnostics | None = None,
+    vocab_size: int | None = None,
+    num_puzzle_identifiers: int | None = None,
 ) -> EpochResult:
     """Run one sampler epoch with upstream ACT carries and loss semantics.
 
@@ -214,25 +220,89 @@ def train_one_epoch(
         if parts is not None:
             sparse_parts[id(optimizer)] = (optimizer, parts)
 
+    parameter_names = {}
+    if diagnostics is not None:
+        parameter_names = {
+            id(parameter): name for name, parameter in model.named_parameters()
+        }
+        parameter_names.update(
+            {
+                id(buffer): name
+                for name, buffer in model.named_buffers()
+                if id(buffer) not in parameter_names
+            }
+        )
+
+    def check_parameters_and_optimizer_state(stage: str) -> None:
+        if diagnostics is None:
+            return
+        for name, parameter in model.named_parameters():
+            diagnostics.check_tensor(f"model.parameter.{name}", parameter, stage=stage)
+        for name, buffer in model.named_buffers():
+            diagnostics.check_tensor(f"model.buffer.{name}", buffer, stage=stage)
+        for optimizer_index, optimizer in enumerate(optimizers):
+            for parameter, state in optimizer.state.items():
+                parameter_name = parameter_names.get(id(parameter), "unnamed_parameter")
+                diagnostics.check_tree(
+                    f"optimizer[{optimizer_index}].state.{parameter_name}",
+                    state,
+                    stage=stage,
+                )
+                if diagnostics.first_failure is not None:
+                    return
+
+    def check_gradients(stage: str) -> None:
+        if diagnostics is None:
+            return
+        seen: set[int] = set()
+        for optimizer_index, optimizer in enumerate(optimizers):
+            for group_index, group in enumerate(optimizer.param_groups):
+                for parameter_index, parameter in enumerate(group["params"]):
+                    if id(parameter) in seen:
+                        continue
+                    seen.add(id(parameter))
+                    if parameter.grad is not None:
+                        name = parameter_names.get(
+                            id(parameter),
+                            f"optimizer[{optimizer_index}].group[{group_index}].parameter[{parameter_index}]",
+                        )
+                        diagnostics.check_tensor(
+                            f"gradient.{name}", parameter.grad, stage=stage
+                        )
+                        if diagnostics.first_failure is not None:
+                            return
+
     def optimizer_update() -> None:
         nonlocal optimizer_step, accumulated_global_examples, accumulated_microbatches, pending
         if not pending or accumulated_global_examples <= 0:
             return
+        if diagnostics is not None:
+            check_gradients("before_optimizer_update")
+            check_parameters_and_optimizer_state("before_optimizer_update")
+            diagnostics.synchronize("before_optimizer_update", device=device)
         for parameter in model.parameters():
             if parameter.grad is not None:
-                assert_finite_tensor(parameter.grad, "model gradient")
+                if diagnostics is None:
+                    assert_finite_tensor(parameter.grad, "model gradient")
                 if world_size > 1:
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.SUM)
                 parameter.grad.div_(accumulated_global_examples)
 
+        if diagnostics is not None:
+            check_gradients("after_distributed_gradient_reduction")
+            diagnostics.synchronize("after_distributed_gradient_reduction", device=device)
+
         for optimizer in optimizers:
             for group in optimizer.param_groups:
                 for parameter in group["params"]:
-                    if parameter.grad is not None:
+                    if parameter.grad is not None and diagnostics is None:
                         assert_finite_tensor(parameter.grad, "optimizer parameter gradient")
 
         if gradient_clip_norm is not None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clip_norm)
+            if diagnostics is not None:
+                check_gradients("after_gradient_clipping")
+                diagnostics.synchronize("after_gradient_clipping", device=device)
 
         optimizer_step += 1
         last_lr = None
@@ -272,14 +342,42 @@ def train_one_epoch(
         if last_lr is not None:
             used_lrs.append(last_lr)
 
+        if diagnostics is not None:
+            diagnostics.set_context(epoch=epoch, optimizer_step=optimizer_step)
+            check_parameters_and_optimizer_state("after_optimizer_update")
+            diagnostics.synchronize("after_optimizer_update", device=device)
+
         accumulated_global_examples = 0
         accumulated_microbatches = 0
         pending = False
+
+    if diagnostics is not None:
+        initial_batch = getattr(carry, "current_data", None)
+        diagnostics.set_context(
+            epoch=epoch,
+            optimizer_step=optimizer_step,
+            batch=initial_batch if isinstance(initial_batch, Mapping) else None,
+        )
+        diagnostics.check_tree("carry.input", carry, stage="epoch_start")
+        check_parameters_and_optimizer_state("epoch_start")
+        diagnostics.synchronize("epoch_start", device=device)
 
     for _set_name, source_batch, global_effective_size in loader:
         if global_effective_size <= 0:
             raise RuntimeError("Sampler emitted an empty training batch")
         batch = {key: value.to(device, non_blocking=True) for key, value in source_batch.items()}
+        if diagnostics is not None:
+            diagnostics.set_context(epoch=epoch, optimizer_step=optimizer_step, batch=batch)
+            diagnostics.check_batch(
+                batch,
+                vocab_size=vocab_size if vocab_size is not None else 2**31 - 1,
+                num_puzzle_identifiers=(
+                    num_puzzle_identifiers
+                    if num_puzzle_identifiers is not None
+                    else 2**31 - 1
+                ),
+            )
+            diagnostics.synchronize("batch_validation", device=device)
         if carry is None:
             with torch.device(device):
                 carry = model.initial_carry(batch)
@@ -288,13 +386,32 @@ def train_one_epoch(
             batch=batch,
             return_keys=(),
         )
-        assert_finite_tensor(loss, "training loss")
+        if diagnostics is None:
+            assert_finite_tensor(loss, "training loss")
+        else:
+            diagnostics.check_tree("carry", carry, stage="forward")
+            for key, value in metrics.items():
+                diagnostics.check_tensor(f"loss_component.{key}", value, stage="forward")
+            diagnostics.check_tensor("loss.total", loss, stage="forward")
+            diagnostics.synchronize("forward", device=device)
+            reduced_loss = loss.detach().to(torch.float64)
+            if world_size > 1:
+                dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
+            reduced_loss.div_(int(global_effective_size))
+            diagnostics.check_tensor(
+                "loss.reduced_global_mean", reduced_loss, stage="loss_reduction"
+            )
+            diagnostics.synchronize("loss_reduction", device=device)
         loss.backward()
+        if diagnostics is not None:
+            check_gradients("after_backward")
+            diagnostics.synchronize("after_backward", device=device)
         if accumulation_steps > 1:
             for optimizer, parts in sparse_parts.values():
                 _weights, local_weights, local_ids = parts
                 if local_weights.grad is not None:
-                    assert_finite_tensor(local_weights.grad, "sparse embedding gradient")
+                    if diagnostics is None:
+                        assert_finite_tensor(local_weights.grad, "sparse embedding gradient")
                     sparse_accumulated.setdefault(id(optimizer), []).append(
                         (local_ids.detach().clone(), local_weights.grad.detach().clone())
                     )
@@ -304,6 +421,13 @@ def train_one_epoch(
         local_rows_forwarded += int(batch["inputs"].shape[0])
         for key, value in metrics.items():
             metric_sums[key] = metric_sums.get(key, 0.0) + float(value.detach().float().item())
+        if diagnostics is not None:
+            diagnostics.check_scalar("loss_sum_local", loss_sum_local, stage="batch_aggregation")
+            for key, value in metric_sums.items():
+                diagnostics.check_scalar(
+                    f"metric_sum_local.{key}", value, stage="batch_aggregation"
+                )
+            diagnostics.synchronize("batch_aggregation", device=device)
         accumulated_global_examples += int(global_effective_size)
         accumulated_microbatches += 1
         pending = True
@@ -312,6 +436,10 @@ def train_one_epoch(
             optimizer_update()
 
     optimizer_update()
+    if diagnostics is not None:
+        diagnostics.set_context(epoch=epoch, optimizer_step=optimizer_step)
+        diagnostics.check_scalar("loss_sum_local", loss_sum_local, stage="epoch_aggregation")
+        diagnostics.synchronize("epoch_aggregation", device=device)
     return EpochResult(
         carry=carry,
         optimizer_step=optimizer_step,
@@ -372,4 +500,3 @@ def validation_improved(candidate: Mapping[str, Any], best: Mapping[str, Any]) -
     return candidate_score > best_score or (
         candidate_score == best_score and candidate_loss < best_loss
     )
-

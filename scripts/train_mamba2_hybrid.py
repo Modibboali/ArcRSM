@@ -13,6 +13,7 @@ import shutil
 import sys
 import time
 import traceback
+import dataclasses
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from arc_agi_trm.experiment import (  # noqa: E402
     tree_map,
     validation_improved,
 )
+from arc_agi_trm.numerics import NumericsDiagnostics  # noqa: E402
 from arc_agi_trm.checkpoints import (  # noqa: E402
     load_checkpoint as read_training_checkpoint,
     load_pretrained,
@@ -131,6 +133,54 @@ def _mamba_modules(layer):
     return ()
 
 
+def _install_numerics_hooks(loss_model, diagnostics: NumericsDiagnostics) -> list[Any]:
+    """Observe Mamba/MLP block stages, recurrent layer outputs, and both heads."""
+
+    from arc_agi_trm.operators import Mamba2MLPBlock
+
+    handles = []
+    for path, module in loss_model.named_modules():
+        if isinstance(module, Mamba2MLPBlock):
+            module._numerics_callback = (
+                lambda operation, tensor, module_path=path: diagnostics.check_tensor(
+                    f"forward.{module_path}.{operation}", tensor, stage="forward"
+                )
+            )
+            def observe_block_input(_module, args, kwargs, *, module_path=path):
+                hidden = kwargs.get("hidden_states")
+                if hidden is None and args:
+                    hidden = args[0]
+                if isinstance(hidden, torch.Tensor):
+                    diagnostics.check_tensor(
+                        f"forward.{module_path}.block_input", hidden, stage="forward"
+                    )
+
+            handles.append(
+                module.register_forward_pre_hook(observe_block_input, with_kwargs=True)
+            )
+        leaf_name = path.rsplit(".", 1)[-1]
+        inside_mamba_or_mlp = ".mamba." in f".{path}." or ".mlp." in f".{path}."
+        watch_module = leaf_name in {
+            "embed_tokens",
+            "puzzle_emb",
+            "L_level",
+            "lm_head",
+            "q_head",
+            "mamba",
+            "mlp",
+        } or (inside_mamba_or_mlp and not any(module.children()))
+        if not watch_module:
+            continue
+
+        def observe_output(_module, _inputs, output, *, module_path=path):
+            diagnostics.check_tree(
+                f"forward.{module_path}.output", output, stage="forward"
+            )
+
+        handles.append(module.register_forward_hook(observe_output))
+    return handles
+
+
 def _atomic_torch_save(payload: Any, destination: Path) -> float:
     started = time.perf_counter()
     temporary = destination.with_suffix(destination.suffix + ".tmp")
@@ -144,6 +194,213 @@ def _atomic_torch_save(payload: Any, destination: Path) -> float:
         if temporary.exists():
             temporary.unlink()
     return time.perf_counter() - started
+
+
+def _first_nonfinite(value: Any, name: str = "state") -> dict[str, Any] | None:
+    if isinstance(value, torch.Tensor):
+        if value.is_floating_point() or value.is_complex():
+            bad_count = int((~torch.isfinite(value)).sum().detach().cpu().item())
+            if bad_count:
+                return {
+                    "tensor_name": name,
+                    "shape": list(value.shape),
+                    "dtype": str(value.dtype),
+                    "non_finite_count": bad_count,
+                }
+        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return {
+            "tensor_name": name,
+            "shape": [],
+            "dtype": "python.float",
+            "non_finite_count": 1,
+        }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            found = _first_nonfinite(item, f"{name}.{key}")
+            if found is not None:
+                return found
+    elif isinstance(value, (tuple, list)):
+        for index, item in enumerate(value):
+            found = _first_nonfinite(item, f"{name}[{index}]")
+            if found is not None:
+                return found
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        for field in dataclasses.fields(value):
+            found = _first_nonfinite(getattr(value, field.name), f"{name}.{field.name}")
+            if found is not None:
+                return found
+    return None
+
+
+def _coordinate_checkpoint_health(
+    failure: dict[str, Any] | None,
+    *,
+    context: str,
+    rank: int,
+    world_size: int,
+    cpu_group,
+    device: torch.device,
+    epoch: int,
+    optimizer_step: int,
+) -> None:
+    if world_size > 1:
+        bad = torch.tensor([int(failure is not None)], dtype=torch.int32, device=device)
+        dist.all_reduce(bad, op=dist.ReduceOp.MAX)
+        if not bool(bad.item()):
+            return
+        gathered: list[dict[str, Any] | None] = [None] * world_size
+        dist.all_gather_object(gathered, failure, group=cpu_group)
+        failures = [item for item in gathered if item is not None]
+    elif failure is not None:
+        failures = [failure]
+    else:
+        return
+    for item in failures:
+        print(
+            json.dumps(
+                {
+                    "event": "checkpoint_numerical_failure",
+                    "rank": item["rank"],
+                    "epoch": epoch,
+                    "optimizer_step": optimizer_step,
+                    **item,
+                },
+                sort_keys=True,
+                allow_nan=False,
+            ),
+            file=sys.stderr,
+            flush=True,
+        )
+    detail = "; ".join(
+        f"rank={item['rank']} tensor={item['tensor_name']} shape={item['shape']} "
+        f"dtype={item['dtype']} non_finite_count={item['non_finite_count']}"
+        for item in failures
+    )
+    raise FloatingPointError(f"Refusing {context} because non-finite state was found: {detail}")
+
+
+def _validate_resume_candidate(checkpoint, *, model, optimizers, rank: int) -> None:
+    """Validate all state that will be loaded before mutating live objects."""
+
+    saved_state = checkpoint["model"]
+    current_state = model.state_dict()
+    missing = sorted(set(current_state) - set(saved_state))
+    unexpected = sorted(set(saved_state) - set(current_state))
+    if missing or unexpected:
+        raise ValueError(
+            f"Resume model state keys differ; missing={missing[:8]}, unexpected={unexpected[:8]}"
+        )
+    for name, expected in current_state.items():
+        value = saved_state[name]
+        if not isinstance(value, torch.Tensor):
+            raise ValueError(f"Resume model state {name} is not a tensor")
+        if tuple(value.shape) != tuple(expected.shape):
+            raise ValueError(
+                f"Resume model state shape mismatch for {name}: "
+                f"checkpoint={tuple(value.shape)}, target={tuple(expected.shape)}"
+            )
+        if value.dtype != expected.dtype:
+            raise ValueError(
+                f"Resume model state dtype mismatch for {name}: "
+                f"checkpoint={value.dtype}, target={expected.dtype}"
+            )
+    runtime = checkpoint["rank_runtime"][rank]
+    carry = runtime.get("carry")
+    carried_ids = getattr(carry, "current_data", {}).get("puzzle_identifiers")
+    puzzle_ids = (
+        sorted({int(value) for value in carried_ids.detach().reshape(-1).cpu().tolist()})
+        if isinstance(carried_ids, torch.Tensor)
+        else []
+    )
+    failure_context = {
+        "rank": rank,
+        "epoch": int(checkpoint["completed_epochs"]),
+        "optimizer_step": int(checkpoint["optimizer_step"]),
+        "puzzle_identifiers": puzzle_ids,
+    }
+
+    def report_rejected_state(kind: str, bad: dict[str, Any]) -> None:
+        record = {
+            "event": "resume_checkpoint_rejected",
+            **failure_context,
+            "failure_kind": kind,
+            **bad,
+        }
+        print(json.dumps(record, sort_keys=True, allow_nan=False), file=sys.stderr, flush=True)
+
+    bad_model = _first_nonfinite(saved_state, "model")
+    if bad_model is not None:
+        report_rejected_state("non_finite_model_state", bad_model)
+        raise ValueError(f"Resume checkpoint has non-finite model state: {bad_model}")
+
+    for optimizer_index, (optimizer, saved_optimizer) in enumerate(
+        zip(optimizers, checkpoint["optimizers"])
+    ):
+        current_optimizer = optimizer.state_dict()
+        saved_groups = saved_optimizer.get("param_groups")
+        current_groups = current_optimizer.get("param_groups")
+        if not isinstance(saved_groups, list) or len(saved_groups) != len(current_groups):
+            raise ValueError(f"Resume optimizer {optimizer_index} has incompatible parameter groups")
+        parameter_by_id: dict[Any, torch.Tensor] = {}
+        for group_index, (saved_group, current_group, live_group) in enumerate(
+            zip(saved_groups, current_groups, optimizer.param_groups)
+        ):
+            if not isinstance(saved_group, dict):
+                raise ValueError(
+                    f"Resume optimizer {optimizer_index} group {group_index} is malformed"
+                )
+            saved_ids = saved_group.get("params")
+            current_ids = current_group.get("params")
+            live_parameters = live_group["params"]
+            if (
+                not isinstance(saved_ids, list)
+                or len(saved_ids) != len(current_ids)
+                or len(saved_ids) != len(live_parameters)
+            ):
+                raise ValueError(
+                    f"Resume optimizer {optimizer_index} group {group_index} has "
+                    "incompatible parameter count"
+                )
+            parameter_by_id.update(zip(saved_ids, live_parameters))
+        saved_state = saved_optimizer.get("state")
+        if not isinstance(saved_state, dict):
+            raise ValueError(f"Resume optimizer {optimizer_index} state is malformed")
+        unknown_ids = set(saved_state) - set(parameter_by_id)
+        if unknown_ids:
+            raise ValueError(
+                f"Resume optimizer {optimizer_index} has state for unknown parameter IDs: "
+                f"{sorted(map(str, unknown_ids))[:8]}"
+            )
+        for parameter_id, state in saved_state.items():
+            if not isinstance(state, dict):
+                raise ValueError(
+                    f"Resume optimizer {optimizer_index} parameter state is malformed"
+                )
+            parameter = parameter_by_id[parameter_id]
+            for state_name, value in state.items():
+                if isinstance(value, torch.Tensor):
+                    if state_name != "step" and tuple(value.shape) != tuple(parameter.shape):
+                        raise ValueError(
+                            f"Resume optimizer state shape mismatch at optimizer[{optimizer_index}]"
+                            f".state[{parameter_id}].{state_name}: checkpoint={tuple(value.shape)}, "
+                            f"parameter={tuple(parameter.shape)}"
+                        )
+                elif not isinstance(value, (int, float, bool)):
+                    raise ValueError(
+                        f"Resume optimizer state optimizer[{optimizer_index}]"
+                        f".state[{parameter_id}].{state_name} has unsupported type "
+                        f"{type(value).__name__}"
+                    )
+        bad_optimizer = _first_nonfinite(saved_optimizer, f"optimizer[{optimizer_index}]")
+        if bad_optimizer is not None:
+            report_rejected_state("non_finite_optimizer_state", bad_optimizer)
+            raise ValueError(f"Resume checkpoint has non-finite optimizer state: {bad_optimizer}")
+
+    bad_carry = _first_nonfinite(carry, f"rank_runtime[{rank}].carry")
+    if bad_carry is not None:
+        report_rejected_state("non_finite_recurrent_carry", bad_carry)
+        raise ValueError(f"Resume checkpoint has non-finite recurrent carry: {bad_carry}")
 
 
 def _point_best_at_latest(latest: Path, best: Path) -> None:
@@ -179,6 +436,35 @@ def save_checkpoint(
         "carry": tree_map(carry, lambda tensor: tensor.detach().cpu()),
         "sampler_iters": int(train_dataset._iters),
     }
+    local_failure = _first_nonfinite(
+        {
+            "model": model.state_dict(),
+            "optimizers": [optimizer.state_dict() for optimizer in optimizers],
+            "carry": local_runtime["carry"],
+        },
+        "checkpoint_candidate",
+    )
+    if local_failure is not None:
+        local_failure["rank"] = rank
+        carry_ids = getattr(local_runtime["carry"], "current_data", {}).get(
+            "puzzle_identifiers"
+        )
+        local_failure["puzzle_identifiers"] = (
+            sorted({int(value) for value in carry_ids.detach().reshape(-1).cpu().tolist()})
+            if isinstance(carry_ids, torch.Tensor)
+            else []
+        )
+    model_device = next(model.parameters()).device
+    _coordinate_checkpoint_health(
+        local_failure,
+        context=f"checkpoint save at epoch={epoch}, optimizer_step={optimizer_step}",
+        rank=rank,
+        world_size=world_size,
+        cpu_group=cpu_group,
+        device=model_device,
+        epoch=epoch,
+        optimizer_step=optimizer_step,
+    )
     if world_size > 1:
         gathered_runtime = [None for _ in range(world_size)] if rank == 0 else None
         dist.gather_object(local_runtime, gathered_runtime, dst=0, group=cpu_group)
@@ -319,6 +605,12 @@ def resume_training(
         )
     if int(checkpoint["completed_epochs"]) > 0 and runtime["carry"] is None:
         raise ValueError("Checkpoint is missing the TRM carry required to continue the next epoch")
+    _validate_resume_candidate(
+        checkpoint,
+        model=model,
+        optimizers=optimizers,
+        rank=rank,
+    )
     model.load_state_dict(checkpoint["model"], strict=True)
     for optimizer, state in zip(optimizers, checkpoint["optimizers"]):
         optimizer.load_state_dict(state)
@@ -337,13 +629,24 @@ def resume_training(
 _load_resume = resume_training
 
 
-def _reduce_epoch_result(result, device: torch.device, world_size: int):
+def _reduce_epoch_result(
+    result,
+    device: torch.device,
+    world_size: int,
+    *,
+    diagnostics: NumericsDiagnostics | None = None,
+    epoch: int = 0,
+):
     keys = sorted(result.metric_sums_local)
     values = [result.loss_sum_local] + [result.metric_sums_local[key] for key in keys]
     values.append(float(result.local_rows_forwarded))
     tensor = torch.tensor(values, dtype=torch.float64, device=device)
     if world_size > 1:
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    if diagnostics is not None:
+        diagnostics.set_context(epoch=epoch, optimizer_step=result.optimizer_step)
+        diagnostics.check_tensor("epoch.reduced_sums", tensor, stage="epoch_reduction")
+        diagnostics.synchronize("epoch_reduction", device=device)
     reduced = tensor.cpu().tolist()
     return reduced[0], {key: reduced[i + 1] for i, key in enumerate(keys)}, reduced[-1]
 
@@ -389,6 +692,12 @@ def _runtime_environment(device: torch.device, world_size: int) -> dict[str, Any
 def run(args: argparse.Namespace) -> int:
     if args.resume and args.init_from:
         raise ValueError("--resume and --init-from are separate modes; choose only one")
+    if args.stop_after_step is not None and args.stop_after_step < 1:
+        raise ValueError("--stop-after-step must be positive")
+    if args.diagnose_numerics and args.stop_after_step is None:
+        raise ValueError(
+            "--diagnose-numerics requires --stop-after-step so diagnostic runs remain bounded"
+        )
     rank, world_size, _local_rank, cpu_group, device = _init_distributed()
     config = load_experiment_config(args.config)
     config["source_config"] = str(Path(args.config).resolve())
@@ -404,6 +713,13 @@ def run(args: argparse.Namespace) -> int:
             run_dir.mkdir(parents=True, exist_ok=True)
         if world_size > 1:
             dist.barrier()
+        if args.diagnose_numerics and any(
+            (run_dir / name).exists() for name in ("latest.pt", "best.pt")
+        ):
+            raise FileExistsError(
+                f"Numerics diagnostic output directory already contains a checkpoint: {run_dir}. "
+                "Choose a fresh --run-dir so the source checkpoint remains untouched."
+            )
 
         global_batch_size = int(config["optimization"]["global_batch_size"])
         train_loader, train_dataset, validation_loader, validation_dataset = create_loaders(
@@ -464,6 +780,20 @@ def run(args: argparse.Namespace) -> int:
                 world_size=world_size,
                 device=device,
             )
+            if rank == 0:
+                print(
+                    json.dumps(
+                        {
+                            "event": "resume_checkpoint_validated",
+                            "path": str(resume_path.resolve()),
+                            "completed_epochs": completed_epochs,
+                            "optimizer_step": optimizer_step,
+                            "world_size": world_size,
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
         else:
             completed_epochs, optimizer_step, carry, best_metrics = 0, 0, None, {}
             timing_summary = {"epoch_duration_sum": 0.0, "epoch_duration_count": 0}
@@ -482,6 +812,24 @@ def run(args: argparse.Namespace) -> int:
                         flush=True,
                     )
             seed_training_rank(int(config["seed"]), rank)
+
+        identifiers, test_puzzles = _load_evaluation_artifacts(dataset_dir)
+        diagnostics = None
+        if args.diagnose_numerics:
+            diagnostics = NumericsDiagnostics(
+                rank=rank,
+                world_size=world_size,
+                cpu_group=cpu_group,
+                log_path=run_dir / f"numerics_rank{rank}.jsonl",
+                puzzle_names=identifiers,
+            )
+            _install_numerics_hooks(loss_model, diagnostics)
+            if rank == 0:
+                print(
+                    f"Opt-in numerical diagnostics enabled; per-rank logs: "
+                    f"{run_dir / 'numerics_rank*.jsonl'}",
+                    flush=True,
+                )
 
         if rank == 0:
             (run_dir / "config_snapshot.json").write_text(
@@ -533,7 +881,6 @@ def run(args: argparse.Namespace) -> int:
                 is_best=False,
             )
 
-        identifiers, test_puzzles = _load_evaluation_artifacts(dataset_dir)
         metrics_path = run_dir / "metrics.jsonl"
         for epoch in range(completed_epochs + 1, int(config["epochs"]) + 1):
             if torch.cuda.is_available():
@@ -556,6 +903,10 @@ def run(args: argparse.Namespace) -> int:
                     gradient_clip_norm=config["optimization"].get("gradient_clip_norm"),
                     rank=rank,
                     world_size=world_size,
+                    epoch=epoch,
+                    diagnostics=diagnostics,
+                    vocab_size=int(config["model"]["vocab_size"]),
+                    num_puzzle_identifiers=int(config["model"]["num_puzzle_identifiers"]),
                 )
             except torch.cuda.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
@@ -573,7 +924,11 @@ def run(args: argparse.Namespace) -> int:
             carry = epoch_result.carry
             optimizer_step = epoch_result.optimizer_step
             loss_sum, reduced_metrics, rows_forwarded = _reduce_epoch_result(
-                epoch_result, device, world_size
+                epoch_result,
+                device,
+                world_size,
+                diagnostics=diagnostics,
+                epoch=epoch,
             )
             training_seconds = time.perf_counter() - epoch_started
             train_loss = loss_sum / max(1, epoch_result.examples_sampled)
@@ -673,10 +1028,17 @@ def run(args: argparse.Namespace) -> int:
                 1, int(timing_summary["epoch_duration_count"])
             )
 
+            stop_after_step = bool(
+                args.stop_after_step is not None
+                and optimizer_step >= args.stop_after_step
+            )
+            if stop_after_step:
+                record["diagnostic_stop_after_step"] = args.stop_after_step
             should_checkpoint = (
                 epoch % int(config["run"]["checkpoint_every_epochs"]) == 0
                 or epoch == int(config["epochs"])
                 or improved
+                or stop_after_step
             )
             if should_checkpoint:
                 record["checkpoint_write_seconds"] = save_checkpoint(
@@ -720,24 +1082,33 @@ def run(args: argparse.Namespace) -> int:
                     stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
                 print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
             completed_epochs = epoch
+            if stop_after_step:
+                break
 
         if rank == 0:
-            save_pretrained(
-                loss_model,
-                run_dir / "final_pretrained.pt",
-                config,
-                metadata={
-                    "completed_epochs": int(config["epochs"]),
-                    "global_step": optimizer_step,
-                    "best_validation": best_metrics,
-                    "experiment_name": config.get("name"),
-                },
-            )
-            print(
-                f"Completed {config['epochs']} epochs for {config['name']}; "
-                f"latest={run_dir / 'latest.pt'}, best={run_dir / 'best.pt'}",
-                flush=True,
-            )
+            if args.stop_after_step is not None and optimizer_step >= args.stop_after_step:
+                print(
+                    f"Stopped at epoch boundary after optimizer_step={optimizer_step}; "
+                    f"diagnostic checkpoint={run_dir / 'latest.pt'}",
+                    flush=True,
+                )
+            else:
+                save_pretrained(
+                    loss_model,
+                    run_dir / "final_pretrained.pt",
+                    config,
+                    metadata={
+                        "completed_epochs": int(config["epochs"]),
+                        "global_step": optimizer_step,
+                        "best_validation": best_metrics,
+                        "experiment_name": config.get("name"),
+                    },
+                )
+                print(
+                    f"Completed {config['epochs']} epochs for {config['name']}; "
+                    f"latest={run_dir / 'latest.pt'}, best={run_dir / 'best.pt'}",
+                    flush=True,
+                )
         return 0
     finally:
         if dist.is_initialized():
@@ -764,6 +1135,16 @@ def parse_args() -> argparse.Namespace:
         "--allow-small-dataset",
         action="store_true",
         help="Permit a non-1,000-task fixture for development only",
+    )
+    parser.add_argument(
+        "--diagnose-numerics",
+        action="store_true",
+        help="Enable opt-in tensor, gradient, parameter, optimizer-state, and distributed finite checks",
+    )
+    parser.add_argument(
+        "--stop-after-step",
+        type=int,
+        help="Stop at the first completed epoch boundary at or after this optimizer step",
     )
     return parser.parse_args()
 

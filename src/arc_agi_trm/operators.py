@@ -243,6 +243,11 @@ class Mamba2MLPBlock(nn.Module):
             expansion=float(config.expansion),
         )
         self._rms_norm = rms_norm
+        self._numerics_callback: Callable[[str, torch.Tensor], None] | None = None
+
+    def _check_numerics(self, name: str, value: torch.Tensor) -> None:
+        if self._numerics_callback is not None:
+            self._numerics_callback(name, value)
 
     def _residual(
         self, hidden_states: torch.Tensor, update: torch.Tensor, *, name: str
@@ -272,12 +277,17 @@ class Mamba2MLPBlock(nn.Module):
         normalized = self._rms_norm(
             hidden_states, variance_epsilon=self.norm_eps
         )
-        hidden_states = self._residual(
-            hidden_states, self.mamba(normalized), name="Mamba-2 sublayer"
-        )
+        self._check_numerics("mamba_norm_input", normalized)
+        mamba_update = self.mamba(normalized)
+        self._check_numerics("mamba_output", mamba_update)
+        hidden_states = self._residual(hidden_states, mamba_update, name="Mamba-2 sublayer")
+        self._check_numerics("mamba_residual", hidden_states)
         normalized = self._rms_norm(
             hidden_states, variance_epsilon=self.norm_eps
         )
-        return self._residual(
-            hidden_states, self.mlp(normalized), name="MLP sublayer"
-        )
+        self._check_numerics("mlp_norm_input", normalized)
+        mlp_update = self.mlp(normalized)
+        self._check_numerics("mlp_output", mlp_update)
+        result = self._residual(hidden_states, mlp_update, name="MLP sublayer")
+        self._check_numerics("mlp_residual", result)
+        return result

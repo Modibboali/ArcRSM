@@ -18,6 +18,7 @@ from arc_agi_trm.experiment import (
     validation_improved,
 )
 from arc_agi_trm.checkpoints import load_checkpoint
+from arc_agi_trm.numerics import NumericsDiagnostics
 from arc_agi_trm.runner import (
     create_hybrid_model,
     create_loaders,
@@ -326,6 +327,53 @@ def test_checkpoint_roundtrip_restores_optimizer_rng_carry_and_epoch(tmp_path) -
     for key, value in saved["model"].items():
         assert torch.equal(best_saved["model"][key], value)
 
+    import copy
+
+    bad_model = copy.deepcopy(latest)
+    bad_model_key = next(
+        key for key, value in bad_model["model"].items() if value.is_floating_point()
+    )
+    bad_model["model"][bad_model_key].view(-1)[0] = float("nan")
+    bad_model_path = tmp_path / "nonfinite-model.pt"
+    torch.save(bad_model, bad_model_path)
+    untouched_model, untouched_optimizers, _ = _model_and_optimizers(config)
+    untouched_parameter = next(untouched_model.parameters()).detach().clone()
+    with pytest.raises(ValueError, match="non-finite model state"):
+        _load_resume(
+            path=bad_model_path,
+            model=untouched_model,
+            optimizers=untouched_optimizers,
+            config=config,
+            train_dataset=DatasetState(),
+            rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+    assert torch.equal(next(untouched_model.parameters()), untouched_parameter)
+
+    bad_optimizer = copy.deepcopy(latest)
+    state_tensor = next(
+        tensor
+        for state in bad_optimizer["optimizers"][1]["state"].values()
+        for tensor in state.values()
+        if isinstance(tensor, torch.Tensor) and tensor.is_floating_point()
+    )
+    state_tensor.view(-1)[0] = float("inf")
+    bad_optimizer_path = tmp_path / "nonfinite-optimizer.pt"
+    torch.save(bad_optimizer, bad_optimizer_path)
+    with pytest.raises(ValueError, match="non-finite optimizer state"):
+        _load_resume(
+            path=bad_optimizer_path,
+            model=untouched_model,
+            optimizers=untouched_optimizers,
+            config=config,
+            train_dataset=DatasetState(),
+            rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+    assert torch.equal(next(untouched_model.parameters()), untouched_parameter)
+
     incomplete_path = tmp_path / "incomplete.pt"
     incomplete = dict(latest)
     incomplete.pop("optimizers")
@@ -365,6 +413,122 @@ def test_corrupted_full_checkpoint_fails_clearly(tmp_path) -> None:
     path.write_bytes(b"not a pytorch checkpoint")
     with pytest.raises(ValueError, match="Could not read trusted training checkpoint"):
         load_checkpoint(path, trusted=True)
+
+
+def test_numerics_diagnostic_logs_first_bad_tensor_and_batch_identifiers(tmp_path) -> None:
+    log_path = tmp_path / "numerics_rank0.jsonl"
+    diagnostics = NumericsDiagnostics(
+        rank=0,
+        world_size=1,
+        log_path=log_path,
+        puzzle_names=["<blank>", "task-a", "task-b"],
+    )
+    diagnostics.set_context(
+        epoch=7,
+        optimizer_step=799,
+        batch={"puzzle_identifiers": torch.tensor([1, 2, 1])},
+    )
+    diagnostics.check_tensor(
+        "forward.lm_head.logits",
+        torch.tensor([[0.0, float("inf")]], dtype=torch.bfloat16),
+        stage="forward",
+    )
+    with pytest.raises(FloatingPointError, match="lm_head.logits"):
+        diagnostics.synchronize("forward", device=torch.device("cpu"))
+
+    record = json.loads(log_path.read_text(encoding="utf-8").splitlines()[0])
+    assert record["rank"] == 0
+    assert record["epoch"] == 7
+    assert record["optimizer_step"] == 799
+    assert record["tensor_name"] == "forward.lm_head.logits"
+    assert record["shape"] == [1, 2]
+    assert record["dtype"] == "torch.bfloat16"
+    assert record["non_finite_count"] == 1
+    assert record["puzzle_identifiers"] == [1, 2]
+    assert record["puzzle_names"] == ["task-a", "task-b"]
+
+
+def test_train_diagnostics_stop_before_backward_on_nonfinite_loss(tmp_path) -> None:
+    class NonFiniteLossModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.ones(()))
+
+        def initial_carry(self, _batch):
+            return None
+
+        def forward(self, *, carry, batch, return_keys):
+            loss = self.weight * batch["inputs"].float().sum() * float("nan")
+            return carry, loss, {"lm_loss": loss.detach()}, None, torch.tensor(True)
+
+    model = NonFiniteLossModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+    diagnostics = NumericsDiagnostics(
+        rank=0,
+        world_size=1,
+        log_path=tmp_path / "train-numerics.jsonl",
+    )
+    batch = {
+        "inputs": torch.tensor([[1, 2]]),
+        "labels": torch.tensor([[2, 3]]),
+        "puzzle_identifiers": torch.tensor([1]),
+    }
+    with pytest.raises(FloatingPointError, match="loss_component.lm_loss"):
+        train_one_epoch(
+            model=model,
+            loader=[("all", batch, 1)],
+            optimizers=[optimizer],
+            optimizer_base_lrs=[0.1],
+            device=torch.device("cpu"),
+            carry=None,
+            optimizer_step=0,
+            total_steps=1,
+            warmup_steps=0,
+            min_lr_ratio=1.0,
+            global_batch_size=1,
+            diagnostics=diagnostics,
+            epoch=7,
+            vocab_size=12,
+            num_puzzle_identifiers=2,
+        )
+    assert model.weight.grad is None
+    record = json.loads(
+        (tmp_path / "train-numerics.jsonl").read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert record["epoch"] == 7
+    assert record["optimizer_step"] == 0
+    assert record["tensor_name"] == "loss_component.lm_loss"
+
+
+def test_checkpoint_save_rejects_nonfinite_state_without_replacing_latest(tmp_path) -> None:
+    config = _small_experiment_config()
+    model, optimizers, _ = _model_and_optimizers(config)
+    latest = tmp_path / "latest.pt"
+    latest.write_bytes(b"preserve-me")
+    with torch.no_grad():
+        next(model.parameters()).fill_(float("inf"))
+
+    class DatasetState:
+        _iters = 0
+
+    with pytest.raises(FloatingPointError, match="checkpoint save"):
+        _save_checkpoint(
+            run_dir=tmp_path,
+            model=model,
+            optimizers=optimizers,
+            config=config,
+            epoch=1,
+            optimizer_step=1,
+            best_metrics={},
+            train_dataset=DatasetState(),
+            carry=None,
+            rank=0,
+            world_size=1,
+            cpu_group=None,
+            timing_summary={"epoch_duration_sum": 0.0, "epoch_duration_count": 0},
+            is_best=False,
+        )
+    assert latest.read_bytes() == b"preserve-me"
 
 
 def test_task_metric_requires_every_test_input_to_match() -> None:
@@ -470,4 +634,3 @@ def test_training_command_fails_clearly_without_cuda(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     with pytest.raises(RuntimeError, match="requires CUDA"):
         _init_distributed()
-

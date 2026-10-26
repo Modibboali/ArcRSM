@@ -201,6 +201,7 @@ def train_one_epoch(
     examples_sampled = 0
     local_rows_forwarded = 0
     metric_sums: dict[str, float] = {}
+    accumulated_metric_sums: dict[str, float] = {}
     used_lrs: list[float] = []
     accumulated_global_examples = 0
     accumulated_microbatches = 0
@@ -276,7 +277,7 @@ def train_one_epoch(
 
     def optimizer_update() -> None:
         nonlocal optimizer_step, accumulated_global_examples, accumulated_microbatches
-        nonlocal accumulated_loss_local, pending
+        nonlocal accumulated_loss_local, accumulated_metric_sums, pending
         if not pending or accumulated_global_examples <= 0:
             return
         if diagnostics is not None:
@@ -389,17 +390,30 @@ def train_one_epoch(
             diagnostics.synchronize("after_optimizer_update", device=device)
 
         if on_optimizer_step is not None:
-            loss_sum = torch.tensor(
-                accumulated_loss_local, dtype=torch.float64, device=device
+            step_statistics = torch.tensor(
+                [
+                    accumulated_loss_local,
+                    accumulated_metric_sums.get("count", 0.0),
+                    accumulated_metric_sums.get("accuracy", 0.0),
+                    accumulated_metric_sums.get("exact_accuracy", 0.0),
+                ],
+                dtype=torch.float64,
+                device=device,
             )
             if world_size > 1:
-                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+                dist.all_reduce(step_statistics, op=dist.ReduceOp.SUM)
+            metric_count = max(0.0, float(step_statistics[1].item()))
             on_optimizer_step(
                 {
                     "epoch": epoch,
                     "optimizer_step": optimizer_step,
-                    "training_loss": float(loss_sum.item())
+                    "training_loss": float(step_statistics[0].item())
                     / max(1, accumulated_global_examples),
+                    "training_grid_accuracy": float(step_statistics[2].item())
+                    / max(1.0, metric_count),
+                    "training_batch_exact_accuracy": float(step_statistics[3].item())
+                    / max(1.0, metric_count),
+                    "training_metric_count": metric_count,
                     "learning_rate": last_lr,
                     "examples": accumulated_global_examples,
                 }
@@ -408,6 +422,7 @@ def train_one_epoch(
         accumulated_global_examples = 0
         accumulated_microbatches = 0
         accumulated_loss_local = 0.0
+        accumulated_metric_sums = {}
         pending = False
 
     if diagnostics is not None:
@@ -497,7 +512,11 @@ def train_one_epoch(
         examples_sampled += int(global_effective_size)
         local_rows_forwarded += int(batch["inputs"].shape[0])
         for key, value in metrics.items():
-            metric_sums[key] = metric_sums.get(key, 0.0) + float(value.detach().float().item())
+            metric_value = float(value.detach().float().item())
+            metric_sums[key] = metric_sums.get(key, 0.0) + metric_value
+            accumulated_metric_sums[key] = (
+                accumulated_metric_sums.get(key, 0.0) + metric_value
+            )
         if diagnostics is not None:
             diagnostics.check_scalar("loss_sum_local", loss_sum_local, stage="batch_aggregation")
             for key, value in metric_sums.items():

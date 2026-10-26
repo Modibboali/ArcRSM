@@ -842,24 +842,11 @@ def run(args: argparse.Namespace) -> int:
         batch_plan["validation_per_device_batch_size"] = validation_dataset.local_batch_size
         if rank == 0:
             print(
-                json.dumps(
-                    {
-                        "event": "resolved_training_plan",
-                        "operator": config["operator"],
-                        "world_size": world_size,
-                        "per_device_batch_size": batch_plan["per_device_batch_size"],
-                        "global_batch_size": batch_plan["microbatch_global_size"],
-                        "gradient_accumulation_steps": batch_plan[
-                            "gradient_accumulation_steps"
-                        ],
-                        "effective_global_batch_size": batch_plan[
-                            "effective_global_batch_size"
-                        ],
-                        "optimizer_updates_per_epoch": optimizer_updates_by_epoch,
-                        "total_optimizer_steps": planned_total_steps,
-                    },
-                    sort_keys=True,
-                ),
+                f"TRM plan | ranks {world_size} | per-device batch "
+                f"{batch_plan['per_device_batch_size']} | global batch {global_batch_size} | "
+                f"accumulation {batch_plan['gradient_accumulation_steps']} | "
+                f"effective batch {batch_plan['effective_global_batch_size']} | "
+                f"optimizer steps {planned_total_steps}",
                 flush=True,
             )
 
@@ -893,16 +880,8 @@ def run(args: argparse.Namespace) -> int:
             )
             if rank == 0:
                 print(
-                    json.dumps(
-                        {
-                            "event": "resume_checkpoint_validated",
-                            "path": str(resume_path.resolve()),
-                            "completed_epochs": completed_epochs,
-                            "optimizer_step": optimizer_step,
-                            "world_size": world_size,
-                        },
-                        sort_keys=True,
-                    ),
+                    f"Resumed {resume_path.resolve()} at epoch {completed_epochs}, "
+                    f"optimizer step {optimizer_step}",
                     flush=True,
                 )
         else:
@@ -1062,7 +1041,11 @@ def run(args: argparse.Namespace) -> int:
                     }
                     _append_jsonl(smoke_memory_path, memory_record)
                     if progress is not None:
-                        progress.write(json.dumps(memory_record, sort_keys=True))
+                        progress.write(
+                            f"Smoke step {update['optimizer_step']}/{args.smoke_test_steps} | "
+                            f"peak allocated {values[0] / (1024 ** 3):.2f} GiB | "
+                            f"reserved {values[1] / (1024 ** 3):.2f} GiB"
+                        )
                 torch.cuda.reset_peak_memory_stats(device)
 
             try:
@@ -1124,7 +1107,11 @@ def run(args: argparse.Namespace) -> int:
                     stream.write(json.dumps(summary, sort_keys=True) + "\n")
                     stream.flush()
                 if progress is not None:
-                    progress.write(json.dumps(summary, sort_keys=True))
+                    progress.write(
+                        f"Smoke test complete | {completed_smoke_steps} optimizer steps | "
+                        f"peak allocated {summary.get('peak_allocated_bytes_max_rank', 0) / (1024 ** 3):.2f} GiB | "
+                        f"reserved {summary.get('peak_reserved_bytes_max_rank', 0) / (1024 ** 3):.2f} GiB"
+                    )
                 progress_status = "smoke-complete"
             return 0
 
@@ -1298,6 +1285,8 @@ def run(args: argparse.Namespace) -> int:
                     best_metrics = decision[0]["best"]
                 if rank == 0 and validation_metrics is not None:
                     record.update(validation_metrics)
+                    if progress is not None:
+                        progress.validation_completed(validation_metrics)
 
             epoch_seconds = time.perf_counter() - epoch_started
             timing_summary = {
@@ -1351,6 +1340,14 @@ def run(args: argparse.Namespace) -> int:
                             "experiment_name": config.get("name"),
                         },
                     )
+                if rank == 0 and progress is not None:
+                    checkpoint_message = (
+                        f"Checkpoint saved | epoch {epoch} | step {optimizer_step} | "
+                        f"{record['checkpoint_path']}"
+                    )
+                    if improved:
+                        checkpoint_message += " | new best"
+                    progress.write(checkpoint_message)
             record["peak_gpu_memory_allocated_bytes"] = int(
                 torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
             )
@@ -1363,9 +1360,6 @@ def run(args: argparse.Namespace) -> int:
                     stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
                 if progress:
                     progress.epoch_completed(epoch, record)
-                    progress.write(json.dumps(record, sort_keys=True, allow_nan=False))
-                else:
-                    print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
             completed_epochs = epoch
             if stop_after_step:
                 break

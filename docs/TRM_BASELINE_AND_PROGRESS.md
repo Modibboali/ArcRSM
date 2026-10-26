@@ -10,19 +10,19 @@ per_device_batch_size = global_batch_size / world_size
 effective_global_batch_size = global_batch_size * gradient_accumulation_steps
 ```
 
-The original upstream-faithful preset specified `global_batch_size: 768` and
-the Kaggle launch used four ranks, so the standalone attention TRM received
-192 examples per GPU. With accumulation 1, its effective update batch was
-768. `model.batch_size` is set from this resolved per-device value because the
-upstream model uses it to size its local sparse-embedding buffers. The
-configuration now records an expected world size and expected per-device
-batch; startup rejects a mismatch and prints the resolved values before model
-construction.
+The failed Kaggle run used `global_batch_size: 768` with four ranks, so the
+standalone attention TRM received 192 examples per GPU. With accumulation 1,
+its effective update batch was 768. The current faithful architecture preset
+sets global batch 64 and expects 32 examples per GPU. At four ranks it
+resolves to 16 per GPU, so startup rejects this mismatch until those values
+are aligned. `model.batch_size` is derived from the resolved per-device value
+because the upstream model uses it to size its local sparse-embedding
+buffers. Startup prints the resolved values before model construction.
 
 The failed run's 192-example allocation explains the reported CUDA OOM during
-the RoPE attention forward. The faithful preset retains that historical batch
-setting and remains separately identifiable as
-`trm-upstream-faithful-100`; it is not the L4 comparison preset.
+the RoPE attention forward. The architecture-faithful preset remains
+separately identifiable as `trm-upstream-faithful-100`; the matched preset
+uses a smaller microbatch for the L4 comparison.
 
 ## Matched standalone TRM preset
 
@@ -99,9 +99,11 @@ torchrun --standalone --max-restarts=0 --nproc_per_node=4 scripts/train_mamba2_h
 ```
 
 The 100-epoch command is documented but has not been launched. The faithful
-historical preset remains available at
-`configs/trm_baseline_100_epochs.json`; on four GPUs its explicit resolution
-is 192 examples per device, 768 global, accumulation 1.
+architecture preset remains available at
+`configs/trm_baseline_100_epochs.json`. Its current global batch 64 and
+expected per-device batch 32 are inconsistent at world size 4, so it is
+rejected at startup; align those values before using that preset. The earlier
+Kaggle run used global 768 and resolved to 192 per device.
 
 ## Progress total and logs
 
@@ -113,15 +115,17 @@ count to optimizer updates with
 `ceil(batch_count / gradient_accumulation_steps)`. The global batch passed to
 the loader already reflects the resolved world-size plan. It refuses to
 create a progress bar if any epoch has zero planned updates, so a broken plan
-cannot display `0/0 opt`. The plan is included in the startup JSON and
+cannot display `0/0`. The plan is included in the startup batch-plan line and
 `config_snapshot.json`; each completed epoch checks the prediction against the
 actual loader and corrects later totals if needed.
 
 Only rank zero creates tqdm. It displays epoch/total epochs, completed/total
-optimizer steps, training loss, learning rate, recent examples per second,
-elapsed time, and approximate ETA. Gradient accumulation's final short
-window counts as an optimizer update. Epoch summaries remain in `metrics.jsonl`
-and `run.log`.
+optimizer steps, rolling training loss, training grid and exact accuracy,
+learning rate, recent examples per second, elapsed time, and approximate ETA.
+After validation completes, it separately displays validation loss and
+validation task exact match. Gradient accumulation's final short window counts
+as an optimizer update. Full epoch summaries remain in `metrics.jsonl` and
+`run.log`; notebook output contains no epoch-metrics JSON dump.
 
 ## Local verification
 
@@ -134,7 +138,8 @@ Run the CPU tests from the repository root:
 These tests exercise the original upstream attention block without importing
 Mamba, run a CPU forward/backward/optimizer update, check progress fields,
 round-trip checkpoints, compare planned counts with actual upstream sampler
-epochs, and assert both batch presets resolve as configured. The real
+epochs, validate matched and fallback batch plans, and reject inconsistent
+batch expectations. The real
 four-GPU forward/backward memory smoke test and CUDA OOM worker shutdown still
 need to run on Kaggle. Do not launch the 100-epoch command until the smoke test
 passes.

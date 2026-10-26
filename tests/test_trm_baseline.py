@@ -28,18 +28,25 @@ class _ProgressBar:
     def __init__(self, **kwargs):
         self.total = kwargs["total"]
         self.n = kwargs["initial"]
-        self.postfix = {}
+        self.description = kwargs["desc"]
+        self.postfix = ""
         self.closed = False
         self.instances.append(self)
 
-    def set_description(self, _description):
-        pass
+    def set_description(self, description):
+        self.description = description
+
+    def set_description_str(self, description):
+        self.description = description
 
     def update(self, amount):
         self.n += amount
 
     def set_postfix(self, values, refresh=False):
-        self.postfix = dict(values)
+        self.postfix = str(values)
+
+    def set_postfix_str(self, value, refresh=False):
+        self.postfix = value
 
     def refresh(self):
         pass
@@ -50,6 +57,17 @@ class _ProgressBar:
     @classmethod
     def write(cls, message):
         cls.messages.append(message)
+
+
+def test_training_progress_rejects_zero_optimizer_step_total():
+    with pytest.raises(ValueError, match="total_steps must be positive"):
+        TrainingProgress(
+            total_steps=0,
+            initial_step=0,
+            initial_epoch=1,
+            total_epochs=1,
+            tqdm_factory=_ProgressBar,
+        )
 
 
 def test_attention_operator_constructs_original_upstream_blocks_without_mamba_import(monkeypatch):
@@ -106,28 +124,42 @@ def test_original_trm_optimizer_progress_and_pretrained_checkpoint_roundtrip(tmp
         warmup_steps=0,
         min_lr_ratio=1.0,
         global_batch_size=2,
+        epoch=1,
         on_optimizer_step=on_step,
     )
     assert result.optimizer_step == 1
     assert len(updates) == 1
     assert math.isfinite(updates[0]["training_loss"])
     assert updates[0]["examples"] == 2
+    assert 0.0 <= updates[0]["training_grid_accuracy"] <= 1.0
+    assert 0.0 <= updates[0]["training_batch_exact_accuracy"] <= 1.0
     assert all(
         parameter.grad is None or torch.isfinite(parameter.grad).all()
         for parameter in loss_model.parameters()
     )
     bar = _ProgressBar.instances[-1]
     assert bar.n == bar.total == 1
-    assert {"loss", "lr", "ex/s", "eta~"} <= bar.postfix.keys()
+    assert bar.description == "TRM | Epoch 1/1 | Steps 1/1"
+    for field in ("Loss", "Grid", "Exact", "LR", "ex/s", "Elapsed", "ETA ~"):
+        assert field in bar.postfix
+    assert "Val loss" not in bar.postfix
+    assert "Val exact" not in bar.postfix
+
+    progress.validation_completed(
+        {"validation_loss": 0.75, "validation_task_exact_match": 0.4}
+    )
+    assert "Val loss 0.750" in bar.postfix
+    assert "Val exact 40.0%" in bar.postfix
 
     progress.epoch_completed(
         1,
         {"training_grid_accuracy": 0.5, "training_batch_exact_accuracy": 0.25},
     )
-    assert set(bar.postfix) == {"loss", "lr", "ex/s", "eta~"}
+    assert "Grid" in bar.postfix and "Exact" in bar.postfix
     progress.close(final_step=1, status="complete")
     assert bar.closed
-    assert set(bar.postfix) == {"loss", "lr", "ex/s", "eta~"}
+    assert "Val loss 0.750" in bar.postfix
+    assert "Val exact 40.0%" in bar.postfix
 
     config = {
         "operator": "attention",
@@ -212,6 +244,86 @@ def test_original_trm_optimizer_progress_and_pretrained_checkpoint_roundtrip(tmp
     assert restored.model._arc_agi_trm_metadata["operator"] == "attention"
 
 
+def test_optimizer_step_metrics_follow_accumulation_and_partial_final_window():
+    class MetricModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(1.0))
+
+        def initial_carry(self, _batch):
+            return None
+
+        def forward(self, carry, batch, return_keys=()):
+            loss = self.weight * batch["loss_value"]
+            metrics = {
+                "count": batch["count"],
+                "accuracy": batch["accuracy"],
+                "exact_accuracy": batch["exact_accuracy"],
+            }
+            return carry, loss, metrics, {}, torch.tensor(True)
+
+    model = MetricModel()
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+    batches = [
+        (
+            "all",
+            {
+                "inputs": torch.zeros(2, 1),
+                "loss_value": torch.tensor(1.0),
+                "count": torch.tensor(2.0),
+                "accuracy": torch.tensor(2.0),
+                "exact_accuracy": torch.tensor(1.0),
+            },
+            2,
+        ),
+        (
+            "all",
+            {
+                "inputs": torch.zeros(2, 1),
+                "loss_value": torch.tensor(3.0),
+                "count": torch.tensor(2.0),
+                "accuracy": torch.tensor(1.0),
+                "exact_accuracy": torch.tensor(0.0),
+            },
+            2,
+        ),
+        (
+            "all",
+            {
+                "inputs": torch.zeros(2, 1),
+                "loss_value": torch.tensor(2.0),
+                "count": torch.tensor(2.0),
+                "accuracy": torch.tensor(0.0),
+                "exact_accuracy": torch.tensor(2.0),
+            },
+            2,
+        ),
+    ]
+    updates = []
+    result = train_one_epoch(
+        model=model,
+        loader=batches,
+        optimizers=[optimizer],
+        optimizer_base_lrs=[0.01],
+        device=torch.device("cpu"),
+        carry=None,
+        optimizer_step=0,
+        total_steps=2,
+        warmup_steps=0,
+        min_lr_ratio=1.0,
+        global_batch_size=2,
+        accumulation_steps=2,
+        on_optimizer_step=updates.append,
+    )
+
+    assert result.optimizer_step == 2
+    assert [update["examples"] for update in updates] == [4, 2]
+    assert updates[0]["training_grid_accuracy"] == pytest.approx(0.75)
+    assert updates[0]["training_batch_exact_accuracy"] == pytest.approx(0.25)
+    assert updates[1]["training_grid_accuracy"] == pytest.approx(0.0)
+    assert updates[1]["training_batch_exact_accuracy"] == pytest.approx(1.0)
+
+
 def _fake_upstream_dataset() -> PuzzleDataset:
     dataset = PuzzleDataset.__new__(PuzzleDataset)
     dataset.config = PuzzleDatasetConfig(
@@ -272,8 +384,8 @@ def test_original_and_matched_baseline_presets_are_distinct():
     assert faithful["expected_world_size"] == matched["expected_world_size"] == 4
     assert faithful["model"]["L_cycles"] == 6
     assert faithful["model"]["pos_encodings"] == "rope"
-    assert faithful["optimization"]["global_batch_size"] == 768
-    assert faithful["optimization"]["expected_per_device_batch_size"] == 192
+    assert faithful["optimization"]["global_batch_size"] == 64
+    assert faithful["optimization"]["expected_per_device_batch_size"] == 32
     assert matched["model"]["L_cycles"] == 4
     assert matched["model"]["pos_encodings"] == "rope"
     assert matched["seed"] == 42
@@ -281,6 +393,9 @@ def test_original_and_matched_baseline_presets_are_distinct():
     assert matched["optimization"]["expected_per_device_batch_size"] == 8
     assert matched["optimization"]["gradient_accumulation_steps"] == 1
     assert faithful["epochs"] == matched["epochs"] == 100
+
+    with pytest.raises(ValueError, match="resolves to 16 examples per rank"):
+        _validate_config(faithful, world_size=4)
 
     plan = _validate_config(matched, world_size=4)
     assert plan["per_device_batch_size"] == 8

@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import platform
+import re
 import shutil
 import sys
 import time
@@ -134,19 +135,36 @@ def _mamba_modules(layer):
 
 
 def _install_numerics_hooks(loss_model, diagnostics: NumericsDiagnostics) -> list[Any]:
-    """Observe Mamba/MLP block stages, recurrent layer outputs, and both heads."""
+    """Observe Mamba/MLP stages and label each shared-block recursion invocation."""
 
     from arc_agi_trm.operators import Mamba2MLPBlock
 
     handles = []
+    model_config = loss_model.model.config
+    for path, module in loss_model.named_modules():
+        if path.endswith("inner.L_level"):
+            handles.append(
+                module.register_forward_pre_hook(
+                    lambda _module, _args, _path=path: diagnostics.begin_l_level_call()
+                )
+            )
+
     for path, module in loss_model.named_modules():
         if isinstance(module, Mamba2MLPBlock):
             module._numerics_callback = (
-                lambda operation, tensor, module_path=path: diagnostics.check_tensor(
-                    f"forward.{module_path}.{operation}", tensor, stage="forward"
+                lambda operation, tensor, module_path=path: (
+                    diagnostics.check_tensor(
+                        f"forward.{module_path}.{operation}", tensor, stage="forward"
+                    ),
+                    diagnostics.record_invocation_tensor(module_path, operation, tensor),
                 )
             )
-            def observe_block_input(_module, args, kwargs, *, module_path=path):
+            layer_match = re.search(r"(?:^|\.)layers\.(\d+)$", path)
+            layer_index = int(layer_match.group(1)) if layer_match else None
+
+            def observe_block_input(
+                _module, args, kwargs, *, module_path=path, layer_index=layer_index
+            ):
                 hidden = kwargs.get("hidden_states")
                 if hidden is None and args:
                     hidden = args[0]
@@ -154,10 +172,19 @@ def _install_numerics_hooks(loss_model, diagnostics: NumericsDiagnostics) -> lis
                     diagnostics.check_tensor(
                         f"forward.{module_path}.block_input", hidden, stage="forward"
                     )
+                    diagnostics.start_block_invocation(
+                        module_path, layer_index, hidden
+                    )
 
             handles.append(
                 module.register_forward_pre_hook(observe_block_input, with_kwargs=True)
             )
+
+            def observe_block_output(_module, _inputs, output, *, module_path=path):
+                if isinstance(output, torch.Tensor):
+                    diagnostics.end_block_invocation(module_path, output)
+
+            handles.append(module.register_forward_hook(observe_block_output))
         leaf_name = path.rsplit(".", 1)[-1]
         inside_mamba_or_mlp = ".mamba." in f".{path}." or ".mlp." in f".{path}."
         watch_module = leaf_name in {
@@ -178,6 +205,14 @@ def _install_numerics_hooks(loss_model, diagnostics: NumericsDiagnostics) -> lis
             )
 
         handles.append(module.register_forward_hook(observe_output))
+
+    # This configuration is fixed for a run. A call to the shared L_level
+    # corresponds to one latent L update or the following H update.
+    diagnostics.recursion_shape = (
+        int(model_config.H_cycles),
+        int(model_config.L_cycles),
+        int(model_config.L_layers),
+    )
     return handles
 
 

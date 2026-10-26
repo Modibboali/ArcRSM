@@ -1,0 +1,10 @@
+{
+  "base": "mamba2_mlp_base.json",
+  "name": "mamba2-mlp-100-lcycles2",
+  "epochs": 100,
+  "model": {
+    "L_cycles": 2,
+    "L_layers": 2
+  },
+  "run_dir": "outputs/mamba2-mlp-100-lcycles2"
+}

@@ -17,12 +17,13 @@ the logits or halt head.
 
 The upstream `ACTLossHead` computes stablemax language loss in float64, but its
 halt loss uses `binary_cross_entropy_with_logits` on float32 halt logits. The
-current training check sees only their combined loss after the complete model
-forward. It does not inspect logits or individual losses. It checks gradients
-after backward, but does not check parameters or optimizer state before and
-after an update. Resume checks checkpoint structure and configuration, but had
-no finite-value validation. A damaged recurrent carry, model parameter, or
-optimizer tensor is therefore another possible source.
+trainer checks output-head tensors and individual losses. It checks gradients
+after backward, model parameters and optimizer state before updates, and state
+immediately around the dense optimizer step. Resume checks checkpoint
+structure, configuration, and finite values before loading. The architecture
+stability audit adds per-invocation activation and gradient summaries, named
+parameter-gradient statistics, and Q-head optimizer-state ranges; see
+[`MAMBA2_MLP_ARCHITECTURE_STABILITY_AUDIT.md`](MAMBA2_MLP_ARCHITECTURE_STABILITY_AUDIT.md).
 
 The reported learning rate is consistent with the configured warmup:
 `0.0001 * 799 / 2000 = 0.00003995`. That confirms the schedule calculation at

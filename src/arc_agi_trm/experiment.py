@@ -279,6 +279,15 @@ def train_one_epoch(
         if diagnostics is not None:
             check_gradients("before_optimizer_update")
             check_parameters_and_optimizer_state("before_optimizer_update")
+            diagnostics.record_model_gradients(
+                model,
+                optimizers,
+                phase="before_distributed_gradient_reduction",
+            )
+            if len(optimizers) > 1:
+                diagnostics.record_q_head_optimizer_state(
+                    optimizers[1], model, phase="before_optimizer_update"
+                )
             diagnostics.synchronize("before_optimizer_update", device=device)
         for parameter in model.parameters():
             if parameter.grad is not None:
@@ -305,8 +314,17 @@ def train_one_epoch(
                 diagnostics.synchronize("after_gradient_clipping", device=device)
 
         optimizer_step += 1
+        if diagnostics is not None:
+            diagnostics.set_context(epoch=epoch, optimizer_step=optimizer_step)
+            diagnostics.record_model_gradients(
+                model,
+                optimizers,
+                phase="immediately_before_optimizer_update",
+            )
         last_lr = None
-        for optimizer, base_lr in zip(optimizers, optimizer_base_lrs):
+        for optimizer_index, (optimizer, base_lr) in enumerate(
+            zip(optimizers, optimizer_base_lrs)
+        ):
             lr = learning_rate_for_step(
                 base_lr=base_lr,
                 step=optimizer_step,
@@ -337,7 +355,27 @@ def train_one_epoch(
                         world_size=int(group["world_size"]),
                     )
             else:
+                if diagnostics is not None and optimizer_index == 1:
+                    check_parameters_and_optimizer_state(
+                        "immediately_before_optimizer_step"
+                    )
+                    diagnostics.synchronize(
+                        "immediately_before_optimizer_step", device=device
+                    )
+                    diagnostics.record_q_head_optimizer_state(
+                        optimizer, model, phase="immediately_before_optimizer_step"
+                    )
                 optimizer.step()
+                if diagnostics is not None and optimizer_index == 1:
+                    diagnostics.record_q_head_optimizer_state(
+                        optimizer, model, phase="immediately_after_optimizer_step"
+                    )
+                    check_parameters_and_optimizer_state(
+                        "immediately_after_optimizer_step"
+                    )
+                    diagnostics.synchronize(
+                        "immediately_after_optimizer_step", device=device
+                    )
             optimizer.zero_grad(set_to_none=True)
         if last_lr is not None:
             used_lrs.append(last_lr)
@@ -381,6 +419,18 @@ def train_one_epoch(
         if carry is None:
             with torch.device(device):
                 carry = model.initial_carry(batch)
+        if diagnostics is not None:
+            configured_model = getattr(model, "model", None)
+            model_config = getattr(configured_model, "config", None)
+            if model_config is not None and all(
+                hasattr(model_config, name)
+                for name in ("H_cycles", "L_cycles", "L_layers")
+            ):
+                diagnostics.begin_recursion_forward(
+                    h_cycles=model_config.H_cycles,
+                    l_cycles=model_config.L_cycles,
+                    l_layers=model_config.L_layers,
+                )
         carry, loss, metrics, _outputs, _all_finished = model(
             carry=carry,
             batch=batch,
@@ -393,7 +443,11 @@ def train_one_epoch(
             for key, value in metrics.items():
                 diagnostics.check_tensor(f"loss_component.{key}", value, stage="forward")
             diagnostics.check_tensor("loss.total", loss, stage="forward")
-            diagnostics.synchronize("forward", device=device)
+            try:
+                diagnostics.synchronize("forward", device=device)
+            except FloatingPointError:
+                diagnostics.finish_recursion_forward()
+                raise
             reduced_loss = loss.detach().to(torch.float64)
             if world_size > 1:
                 dist.all_reduce(reduced_loss, op=dist.ReduceOp.SUM)
@@ -404,6 +458,7 @@ def train_one_epoch(
             diagnostics.synchronize("loss_reduction", device=device)
         loss.backward()
         if diagnostics is not None:
+            diagnostics.finish_recursion_forward()
             check_gradients("after_backward")
             diagnostics.synchronize("after_backward", device=device)
         if accumulation_steps > 1:

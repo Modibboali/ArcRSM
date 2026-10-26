@@ -26,7 +26,12 @@ from arc_agi_trm.runner import (
     evaluate_validation,
 )
 from scripts.build_arc_agi2_from_kaggle import build_dataset
-from scripts.train_mamba2_hybrid import _init_distributed, _load_resume, _save_checkpoint
+from scripts.train_mamba2_hybrid import (
+    _init_distributed,
+    _install_numerics_hooks,
+    _load_resume,
+    _save_checkpoint,
+)
 from test_mamba2_hybrid import FakeMamba2
 from test_trm_smoke import synthetic_batch, tiny_config
 
@@ -92,6 +97,23 @@ def test_both_experiment_presets_only_change_budget_and_run_identity() -> None:
     assert short["model"]["mamba_d_conv"] == 4
     assert short["optimization"]["global_batch_size"] == 32
     assert short["data"]["num_aug"] == 1000
+
+
+def test_mamba2_mlp_depth_ablation_presets_only_change_requested_depth() -> None:
+    two_layer = load_experiment_config(PROJECT_ROOT / "configs" / "mamba2_mlp_100_epochs.json")
+    one_layer = load_experiment_config(PROJECT_ROOT / "configs" / "mamba2_mlp_depth1_100_epochs.json")
+    assert two_layer["model"]["L_layers"] == 2
+    assert one_layer["model"]["L_layers"] == 1
+    for key in ("operator", "seed", "epochs", "data", "optimization", "run"):
+        assert two_layer[key] == one_layer[key]
+    assert {key: value for key, value in two_layer["model"].items() if key != "L_layers"} == {
+        key: value for key, value in one_layer["model"].items() if key != "L_layers"
+    }
+    lcycle2_two = load_experiment_config(PROJECT_ROOT / "configs" / "mamba2_mlp_lcycles2_100_epochs.json")
+    lcycle2_one = load_experiment_config(PROJECT_ROOT / "configs" / "mamba2_mlp_depth1_lcycles2_100_epochs.json")
+    assert lcycle2_two["model"]["L_cycles"] == lcycle2_one["model"]["L_cycles"] == 2
+    assert lcycle2_two["model"]["L_layers"] == 2
+    assert lcycle2_one["model"]["L_layers"] == 1
 
 
 def test_batch_sizes_reject_nondivisible_distributed_global_batch() -> None:
@@ -446,6 +468,126 @@ def test_numerics_diagnostic_logs_first_bad_tensor_and_batch_identifiers(tmp_pat
     assert record["non_finite_count"] == 1
     assert record["puzzle_identifiers"] == [1, 2]
     assert record["puzzle_names"] == ["task-a", "task-b"]
+    stats = NumericsDiagnostics.tensor_stats(torch.tensor([3.0, 4.0, float("inf")]))
+    assert stats["finite_count"] == 2
+    assert stats["non_finite_count"] == 1
+    assert stats["l2_norm"] == pytest.approx(5.0)
+    assert stats["std"] == pytest.approx(0.5)
+
+
+def test_recursion_diagnostic_labels_shared_invocations_and_captures_gradients(tmp_path) -> None:
+    diagnostics = NumericsDiagnostics(
+        rank=0,
+        world_size=1,
+        log_path=tmp_path / "numerics_rank0.jsonl",
+    )
+    diagnostics.set_context(epoch=2, optimizer_step=17)
+    diagnostics.begin_recursion_forward(h_cycles=3, l_cycles=4, l_layers=1)
+    loss = torch.tensor(0.0)
+    for call_index in range(15):
+        has_grad = call_index >= 10
+        with torch.set_grad_enabled(has_grad):
+            diagnostics.begin_l_level_call()
+            hidden = torch.tensor([1.0, 2.0], requires_grad=True)
+            module_path = "model.inner.L_level.layers.0"
+            diagnostics.start_block_invocation(module_path, 0, hidden)
+            normalized = hidden / 2
+            branch = normalized * 0.25
+            residual = hidden + branch
+            diagnostics.record_invocation_tensor(module_path, "mamba_norm_input", normalized)
+            diagnostics.record_invocation_tensor(module_path, "mamba_output", branch)
+            diagnostics.record_invocation_tensor(module_path, "mamba_residual", residual)
+            output = residual + normalized
+            diagnostics.end_block_invocation(module_path, output)
+            if has_grad:
+                loss = loss + output.sum()
+    loss.backward()
+    diagnostics.finish_recursion_forward()
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "propagation_rank0.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 1
+    invocations = records[0]["invocations"]
+    assert len(invocations) == 15
+    assert invocations[0]["h_cycle"] == 0
+    assert invocations[0]["latent_update"] == "L0"
+    assert invocations[0]["autograd_enabled"] is False
+    assert invocations[10]["h_cycle"] == 2
+    assert invocations[10]["latent_update"] == "L0"
+    assert invocations[14]["latent_update"] == "H"
+    assert invocations[10]["gradient"]["block_input"]["l2_norm"] > 0
+    assert invocations[10]["forward"]["mamba_residual"]["finite_count"] == 2
+
+
+def test_mamba2_mlp_hooks_capture_actual_shared_layer_calls(tmp_path) -> None:
+    config = _small_experiment_config()
+    config["operator"] = "mamba2_mlp"
+    config["model"].update(
+        mamba_d_ssm=None,
+        mamba_ngroups=1,
+        mamba_rmsnorm=True,
+        mamba_norm_before_gate=False,
+        mamba_chunk_size=16,
+        mamba_use_mem_eff_path=True,
+        mamba_bias=False,
+        mamba_conv_bias=True,
+    )
+    model, optimizers, base_lrs = _model_and_optimizers(config)
+    batch = synthetic_batch()
+    diagnostics = NumericsDiagnostics(
+        rank=0,
+        world_size=1,
+        log_path=tmp_path / "numerics_rank0.jsonl",
+    )
+    _install_numerics_hooks(model, diagnostics)
+    train_one_epoch(
+        model=model,
+        loader=[("all", batch, 2)],
+        optimizers=optimizers,
+        optimizer_base_lrs=base_lrs,
+        device=torch.device("cpu"),
+        carry=None,
+        optimizer_step=0,
+        total_steps=1,
+        warmup_steps=0,
+        min_lr_ratio=1.0,
+        global_batch_size=2,
+        diagnostics=diagnostics,
+        epoch=2,
+        vocab_size=12,
+        num_puzzle_identifiers=4,
+    )
+
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "propagation_rank0.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    record = next(item for item in records if item["event"] == "recursion_forward_summary")
+    invocations = record["invocations"]
+    assert len(invocations) == 3 * (2 + 1)
+    assert invocations[0]["module"].endswith("L_level.layers.0")
+    assert invocations[0]["autograd_enabled"] is False
+    assert invocations[6]["h_cycle"] == 2
+    assert invocations[6]["latent_update"] == "L0"
+    assert invocations[6]["autograd_enabled"] is True
+    assert invocations[6]["forward"]["mamba_output"]["finite_count"] > 0
+    assert invocations[6]["gradient"]["mlp_output"]["l2_norm"] > 0
+    gradient_summary = next(
+        item for item in records
+        if item["event"] == "gradient_summary"
+        and item["phase"] == "immediately_before_optimizer_update"
+    )
+    assert gradient_summary["q_head_weight_name"].endswith("inner.q_head.weight")
+    assert gradient_summary["q_head_weight_gradient"]["l2_norm"] > 0
+    q_head_state = [item for item in records if item["event"] == "q_head_optimizer_state"]
+    after_step = next(
+        item for item in q_head_state
+        if item["phase"] == "immediately_after_optimizer_step"
+    )
+    assert after_step["optimizer_class"] == "AdamW"
+    assert after_step["fields"]["exp_avg_sq"]["finite_count"] == 2 * 32
 
 
 def test_train_diagnostics_stop_before_backward_on_nonfinite_loss(tmp_path) -> None:

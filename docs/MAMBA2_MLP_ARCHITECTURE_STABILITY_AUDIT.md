@@ -14,7 +14,7 @@ created. Each contains one distinct Mamba-2 module and one distinct SwiGLU
 module, for two Mamba-2 mixers and two MLPs total. There is no module cloning
 or per-cycle construction. Both blocks are reused across all H and L updates.
 The LM head and Q head are the original single upstream modules.
-
+ 
 The forward schedule for `H_cycles=3`, `L_cycles=4` is:
 
 ```text

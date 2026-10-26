@@ -7,7 +7,7 @@ import json
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import torch
@@ -17,7 +17,7 @@ from .numerics import NumericsDiagnostics
 
 
 def load_experiment_config(path: str | Path) -> dict[str, Any]:
-    """Load a run preset layered over the shared Mamba-2 base JSON file."""
+    """Load a run preset layered over a shared base JSON file."""
 
     path = Path(path).expanduser().resolve()
     with path.open("r", encoding="utf-8") as stream:
@@ -179,6 +179,7 @@ def train_one_epoch(
     diagnostics: NumericsDiagnostics | None = None,
     vocab_size: int | None = None,
     num_puzzle_identifiers: int | None = None,
+    on_optimizer_step: Callable[[dict[str, Any]], None] | None = None,
 ) -> EpochResult:
     """Run one sampler epoch with upstream ACT carries and loss semantics.
 
@@ -203,6 +204,7 @@ def train_one_epoch(
     used_lrs: list[float] = []
     accumulated_global_examples = 0
     accumulated_microbatches = 0
+    accumulated_loss_local = 0.0
     pending = False
     sparse_accumulated: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = {}
 
@@ -273,7 +275,8 @@ def train_one_epoch(
                             return
 
     def optimizer_update() -> None:
-        nonlocal optimizer_step, accumulated_global_examples, accumulated_microbatches, pending
+        nonlocal optimizer_step, accumulated_global_examples, accumulated_microbatches
+        nonlocal accumulated_loss_local, pending
         if not pending or accumulated_global_examples <= 0:
             return
         if diagnostics is not None:
@@ -385,8 +388,26 @@ def train_one_epoch(
             check_parameters_and_optimizer_state("after_optimizer_update")
             diagnostics.synchronize("after_optimizer_update", device=device)
 
+        if on_optimizer_step is not None:
+            loss_sum = torch.tensor(
+                accumulated_loss_local, dtype=torch.float64, device=device
+            )
+            if world_size > 1:
+                dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+            on_optimizer_step(
+                {
+                    "epoch": epoch,
+                    "optimizer_step": optimizer_step,
+                    "training_loss": float(loss_sum.item())
+                    / max(1, accumulated_global_examples),
+                    "learning_rate": last_lr,
+                    "examples": accumulated_global_examples,
+                }
+            )
+
         accumulated_global_examples = 0
         accumulated_microbatches = 0
+        accumulated_loss_local = 0.0
         pending = False
 
     if diagnostics is not None:
@@ -472,6 +493,7 @@ def train_one_epoch(
                     )
                     local_weights.grad = None
         loss_sum_local += float(loss.detach().float().item())
+        accumulated_loss_local += float(loss.detach().float().item())
         examples_sampled += int(global_effective_size)
         local_rows_forwarded += int(batch["inputs"].shape[0])
         for key, value in metrics.items():

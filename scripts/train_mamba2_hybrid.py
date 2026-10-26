@@ -50,9 +50,11 @@ from arc_agi_trm.runner import (  # noqa: E402
     create_experiment_model,
     create_loaders,
     create_optimizers,
+    estimate_train_optimizer_updates,
     evaluate_validation,
     load_dataset_manifest,
 )
+from arc_agi_trm.progress import TrainingProgress  # noqa: E402
 
 
 def _resolve_from_root(path: str | Path) -> Path:
@@ -63,8 +65,7 @@ def _resolve_from_root(path: str | Path) -> Path:
 def _init_distributed():
     if not torch.cuda.is_available():
         raise RuntimeError(
-            "This experiment entry point requires CUDA. Mamba-2 operators also require "
-            "the qualified mamba-ssm/causal-conv1d kernels. No CUDA device is available; "
+            "This experiment entry point requires CUDA. No CUDA device is available; "
             "use CPU unit tests and run configured training in the prepared Kaggle image."
         )
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -734,9 +735,13 @@ def run(args: argparse.Namespace) -> int:
             "--diagnose-numerics requires --stop-after-step so diagnostic runs remain bounded"
         )
     rank, world_size, _local_rank, cpu_group, device = _init_distributed()
+    progress = None
+    progress_status = "incomplete"
+    optimizer_step = 0
     config = load_experiment_config(args.config)
     config["source_config"] = str(Path(args.config).resolve())
     run_dir = _resolve_from_root(args.run_dir or config["run_dir"])
+    config["run_dir"] = str(run_dir)
     dataset_dir = _resolve_from_root(args.dataset)
     try:
         manifest = load_dataset_manifest(dataset_dir)
@@ -764,6 +769,14 @@ def run(args: argparse.Namespace) -> int:
             rank=rank,
             world_size=world_size,
         )
+        optimizer_updates_by_epoch = estimate_train_optimizer_updates(
+            train_dataset,
+            epochs=int(config["epochs"]),
+            accumulation_steps=int(config["optimization"]["gradient_accumulation_steps"]),
+        )
+        optimizer_steps_by_epoch = [0]
+        for updates in optimizer_updates_by_epoch:
+            optimizer_steps_by_epoch.append(optimizer_steps_by_epoch[-1] + updates)
         config["model"].update(
             batch_size=batch_plan["per_device_batch_size"],
             seq_len=int(train_dataset.metadata.seq_len),
@@ -848,6 +861,21 @@ def run(args: argparse.Namespace) -> int:
                     )
             seed_training_rank(int(config["seed"]), rank)
 
+        progress_final_epoch = int(config["epochs"])
+        if args.stop_after_step is not None:
+            first_epoch_to_run = min(int(config["epochs"]), completed_epochs + 1)
+            if optimizer_step >= args.stop_after_step:
+                progress_final_epoch = first_epoch_to_run
+            else:
+                for candidate_epoch in range(first_epoch_to_run, int(config["epochs"]) + 1):
+                    if optimizer_steps_by_epoch[candidate_epoch] >= args.stop_after_step:
+                        progress_final_epoch = candidate_epoch
+                        break
+        progress_total_steps = max(
+            optimizer_step,
+            optimizer_steps_by_epoch[progress_final_epoch],
+        )
+
         identifiers, test_puzzles = _load_evaluation_artifacts(dataset_dir)
         diagnostics = None
         if args.diagnose_numerics:
@@ -875,6 +903,8 @@ def run(args: argparse.Namespace) -> int:
                         "runtime_environment": _runtime_environment(device, world_size),
                         "batch_sizes": batch_plan,
                         "estimated_optimizer_steps": estimated_total_steps,
+                        "progress_optimizer_updates_per_epoch": optimizer_updates_by_epoch,
+                        "progress_total_optimizer_steps": progress_total_steps,
                         "model_parameter_count": sum(
                             parameter.numel() for parameter in loss_model.parameters()
                         ),
@@ -916,6 +946,14 @@ def run(args: argparse.Namespace) -> int:
                 is_best=False,
             )
 
+        if rank == 0:
+            progress = TrainingProgress(
+                total_steps=progress_total_steps,
+                initial_step=optimizer_step,
+                initial_epoch=min(int(config["epochs"]), completed_epochs + 1),
+                total_epochs=int(config["epochs"]),
+            )
+
         metrics_path = run_dir / "metrics.jsonl"
         for epoch in range(completed_epochs + 1, int(config["epochs"]) + 1):
             if torch.cuda.is_available():
@@ -942,6 +980,9 @@ def run(args: argparse.Namespace) -> int:
                     diagnostics=diagnostics,
                     vocab_size=int(config["model"]["vocab_size"]),
                     num_puzzle_identifiers=int(config["model"]["num_puzzle_identifiers"]),
+                    on_optimizer_step=(
+                        (lambda update: progress.optimizer_step(update) if progress else None)
+                    ),
                 )
             except torch.cuda.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
@@ -956,8 +997,32 @@ def run(args: argparse.Namespace) -> int:
                 raise RuntimeError(
                     f"Sampler emitted no complete batches in epoch {epoch}; the epoch was not completed"
                 )
+            actual_epoch_updates = epoch_result.optimizer_step - optimizer_step
+            predicted_epoch_updates = optimizer_updates_by_epoch[epoch - 1]
+            if actual_epoch_updates != predicted_epoch_updates and rank == 0:
+                message = (
+                    f"Progress estimate adjusted: sampler emitted {actual_epoch_updates} "
+                    f"optimizer updates in epoch {epoch}; planned {predicted_epoch_updates}."
+                )
+                if progress:
+                    progress.write(message)
+                else:
+                    print(message, flush=True)
             carry = epoch_result.carry
             optimizer_step = epoch_result.optimizer_step
+            if args.stop_after_step is not None and optimizer_step >= args.stop_after_step:
+                progress_total_steps = optimizer_step
+            else:
+                progress_total_steps = optimizer_step
+                for future_epoch in range(epoch, int(config["epochs"])):
+                    progress_total_steps += optimizer_updates_by_epoch[future_epoch]
+                    if (
+                        args.stop_after_step is not None
+                        and progress_total_steps >= args.stop_after_step
+                    ):
+                        break
+            if progress is not None:
+                progress.set_total(progress_total_steps)
             loss_sum, reduced_metrics, rows_forwarded = _reduce_epoch_result(
                 epoch_result,
                 device,
@@ -1115,18 +1180,26 @@ def run(args: argparse.Namespace) -> int:
                 _append_jsonl(metrics_path, record)
                 with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
-                print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
+                if progress:
+                    progress.epoch_completed(epoch, record)
+                    progress.write(json.dumps(record, sort_keys=True, allow_nan=False))
+                else:
+                    print(json.dumps(record, sort_keys=True, allow_nan=False), flush=True)
             completed_epochs = epoch
             if stop_after_step:
                 break
 
         if rank == 0:
             if args.stop_after_step is not None and optimizer_step >= args.stop_after_step:
-                print(
+                message = (
                     f"Stopped at epoch boundary after optimizer_step={optimizer_step}; "
-                    f"diagnostic checkpoint={run_dir / 'latest.pt'}",
-                    flush=True,
+                    f"diagnostic checkpoint={run_dir / 'latest.pt'}"
                 )
+                if progress:
+                    progress.write(message)
+                else:
+                    print(message, flush=True)
+                progress_status = "diagnostic-stop"
             else:
                 save_pretrained(
                     loss_model,
@@ -1139,13 +1212,19 @@ def run(args: argparse.Namespace) -> int:
                         "experiment_name": config.get("name"),
                     },
                 )
-                print(
+                message = (
                     f"Completed {config['epochs']} epochs for {config['name']}; "
-                    f"latest={run_dir / 'latest.pt'}, best={run_dir / 'best.pt'}",
-                    flush=True,
+                    f"latest={run_dir / 'latest.pt'}, best={run_dir / 'best.pt'}"
                 )
+                if progress:
+                    progress.write(message)
+                else:
+                    print(message, flush=True)
+                progress_status = "complete"
         return 0
     finally:
+        if progress is not None:
+            progress.close(final_step=optimizer_step, status=progress_status)
         if dist.is_initialized():
             dist.destroy_process_group()
 

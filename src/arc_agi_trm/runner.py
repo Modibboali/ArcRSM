@@ -147,6 +147,62 @@ def create_loaders(
     return train_loader, train_dataset, validation_loader, validation_dataset
 
 
+def estimate_train_optimizer_updates(
+    train_dataset,
+    *,
+    epochs: int,
+    accumulation_steps: int,
+    starting_sampler_iters: int = 0,
+) -> list[int]:
+    """Count exact upstream sampler updates per epoch without consuming its RNG.
+
+    ``PuzzleDataset`` is an ``IterableDataset`` with no ``__len__``. Its sampler
+    groups shuffled tasks and samples one puzzle from each task, so metadata's
+    mean example count cannot give an exact epoch length. This mirrors only the
+    upstream batch-packing decisions using its index arrays and Philox stream;
+    it does not touch NumPy's process-global RNG or advance ``_iters``.
+    """
+
+    if epochs < 1 or accumulation_steps < 1:
+        raise ValueError("epochs and accumulation_steps must be positive")
+    train_dataset._lazy_load_dataset()
+    sampler = train_dataset.config
+    global_batch_size = int(sampler.global_batch_size)
+    epochs_per_iter = int(sampler.epochs_per_iter)
+    sampler_iters = int(starting_sampler_iters)
+    updates_per_epoch: list[int] = []
+
+    for _epoch in range(epochs):
+        batch_count = 0
+        for dataset in train_dataset._data.values():
+            sampler_iters += 1
+            rng = np.random.Generator(np.random.Philox(seed=int(sampler.seed) + sampler_iters))
+            group_indices = dataset["group_indices"]
+            puzzle_indices = dataset["puzzle_indices"]
+            groups_per_iter = int(group_indices.size - 1)
+            group_order = np.concatenate(
+                [rng.permutation(groups_per_iter) for _ in range(epochs_per_iter)]
+            )
+            start_index = 0
+            while start_index < group_order.size:
+                current_size = 0
+                while start_index < group_order.size and current_size < global_batch_size:
+                    group_id = int(group_order[start_index])
+                    puzzle_id = int(
+                        rng.integers(group_indices[group_id], group_indices[group_id + 1])
+                    )
+                    puzzle_size = int(puzzle_indices[puzzle_id + 1] - puzzle_indices[puzzle_id])
+                    start_index += 1
+                    current_size += min(puzzle_size, global_batch_size - current_size)
+                if current_size < global_batch_size:
+                    break
+                batch_count += 1
+        updates_per_epoch.append(
+            (batch_count + accumulation_steps - 1) // accumulation_steps
+        )
+    return updates_per_epoch
+
+
 def create_experiment_model(
     config: Mapping[str, Any],
     metadata,
@@ -407,4 +463,3 @@ def evaluate_validation(
         "validation_protocol": "one greedy top-1 output per public training-task test input; a task is solved only when every test output is exact",
         "validation_inference_seconds": elapsed,
     }
-

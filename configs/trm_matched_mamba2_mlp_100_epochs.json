@@ -1,0 +1,7 @@
+{
+  "base": "mamba2_mlp_base.json",
+  "operator": "attention",
+  "name": "trm-matched-mamba2-mlp-100",
+  "epochs": 100,
+  "run_dir": "outputs/trm-matched-mamba2-mlp-100"
+}

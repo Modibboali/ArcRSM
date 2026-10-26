@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+from itertools import islice
 import json
 import logging
 import math
@@ -111,6 +112,12 @@ def _validate_config(config: dict[str, Any], world_size: int) -> dict[str, int]:
         raise ValueError("TRM recursive cycle counts must be positive")
     if int(config["model"]["L_layers"]) < 1:
         raise ValueError("The model requires at least one shared TRM block")
+    expected_world_size = config.get("expected_world_size")
+    if expected_world_size is not None and int(expected_world_size) != world_size:
+        raise ValueError(
+            f"This preset expects world_size={int(expected_world_size)}, "
+            f"but torchrun resolved world_size={world_size}"
+        )
     run_settings = config["run"]
     if int(run_settings.get("num_workers", 0)) != 0:
         raise ValueError(
@@ -120,11 +127,25 @@ def _validate_config(config: dict[str, Any], world_size: int) -> dict[str, int]:
         raise ValueError("Evaluation and checkpoint intervals must be positive")
     if int(run_settings["eval_attempts"]) != 1:
         raise ValueError("This preset uses one greedy top-1 validation attempt")
-    return batch_sizes(
+    plan = batch_sizes(
         int(config["optimization"]["global_batch_size"]),
         world_size,
         int(config["optimization"]["gradient_accumulation_steps"]),
     )
+    expected_per_device = config["optimization"].get(
+        "expected_per_device_batch_size"
+    )
+    if expected_per_device is not None and int(expected_per_device) != plan[
+        "per_device_batch_size"
+    ]:
+        raise ValueError(
+            "Batch configuration mismatch: global_batch_size is the aggregate "
+            "microbatch across all ranks, so it resolves to "
+            f"{plan['per_device_batch_size']} examples per rank at world_size={world_size}; "
+            f"the preset explicitly expects {int(expected_per_device)}. "
+            "Change global_batch_size and expected_per_device_batch_size together."
+        )
+    return plan
 
 
 def _mamba_modules(layer):
@@ -730,6 +751,17 @@ def run(args: argparse.Namespace) -> int:
         raise ValueError("--resume and --init-from are separate modes; choose only one")
     if args.stop_after_step is not None and args.stop_after_step < 1:
         raise ValueError("--stop-after-step must be positive")
+    if args.smoke_test_steps is not None and args.smoke_test_steps < 1:
+        raise ValueError("--smoke-test-steps must be positive")
+    if args.smoke_test_steps is not None and any(
+        (args.resume, args.init_from, args.stop_after_step, args.diagnose_numerics)
+    ):
+        raise ValueError(
+            "--smoke-test-steps uses a fresh, bounded run; do not combine it with "
+            "--resume, --init-from, --stop-after-step, or --diagnose-numerics"
+        )
+    if args.smoke_test_steps is not None and args.run_dir is None:
+        raise ValueError("--smoke-test-steps requires an explicit fresh --run-dir")
     if args.diagnose_numerics and args.stop_after_step is None:
         raise ValueError(
             "--diagnose-numerics requires --stop-after-step so diagnostic runs remain bounded"
@@ -749,6 +781,10 @@ def run(args: argparse.Namespace) -> int:
         check_dataset_config(manifest, config, allow_small=args.allow_small_dataset)
         batch_plan = _validate_config(config, world_size)
 
+        if args.smoke_test_steps is not None and run_dir.exists() and any(run_dir.iterdir()):
+            raise FileExistsError(
+                f"Smoke-test output directory must be fresh and empty: {run_dir}"
+            )
         if rank == 0:
             run_dir.mkdir(parents=True, exist_ok=True)
         if world_size > 1:
@@ -777,28 +813,55 @@ def run(args: argparse.Namespace) -> int:
         optimizer_steps_by_epoch = [0]
         for updates in optimizer_updates_by_epoch:
             optimizer_steps_by_epoch.append(optimizer_steps_by_epoch[-1] + updates)
+        if len(optimizer_updates_by_epoch) != int(config["epochs"]):
+            raise RuntimeError(
+                "Progress planner did not return one sampler count per configured epoch"
+            )
+        empty_epochs = [
+            epoch
+            for epoch, updates in enumerate(optimizer_updates_by_epoch, start=1)
+            if updates <= 0
+        ]
+        if empty_epochs:
+            raise RuntimeError(
+                "The upstream sampler plan contains zero optimizer updates for epoch(s) "
+                f"{empty_epochs}; refusing to start a 0/0 progress bar or allocate the model. "
+                "Check the training dataset, global_batch_size, world_size, and "
+                "gradient_accumulation_steps."
+            )
+        planned_total_steps = optimizer_steps_by_epoch[-1]
+        config["estimated_total_optimizer_steps"] = planned_total_steps
         config["model"].update(
             batch_size=batch_plan["per_device_batch_size"],
             seq_len=int(train_dataset.metadata.seq_len),
             vocab_size=int(train_dataset.metadata.vocab_size),
             num_puzzle_identifiers=int(train_dataset.metadata.num_puzzle_identifiers),
         )
+        if int(config["model"]["batch_size"]) != batch_plan["per_device_batch_size"]:
+            raise AssertionError("Model batch_size diverged from the resolved per-device batch")
         batch_plan["validation_per_device_batch_size"] = validation_dataset.local_batch_size
-        examples_per_epoch_estimate = (
-            train_dataset.metadata.total_groups * train_dataset.metadata.mean_puzzle_examples
-        )
-        estimated_total_steps = max(
-            1,
-            int(
-                int(config["epochs"])
-                * examples_per_epoch_estimate
-                / (
-                    global_batch_size
-                    * int(config["optimization"]["gradient_accumulation_steps"])
-                )
-            ),
-        )
-        config["estimated_total_optimizer_steps"] = estimated_total_steps
+        if rank == 0:
+            print(
+                json.dumps(
+                    {
+                        "event": "resolved_training_plan",
+                        "operator": config["operator"],
+                        "world_size": world_size,
+                        "per_device_batch_size": batch_plan["per_device_batch_size"],
+                        "global_batch_size": batch_plan["microbatch_global_size"],
+                        "gradient_accumulation_steps": batch_plan[
+                            "gradient_accumulation_steps"
+                        ],
+                        "effective_global_batch_size": batch_plan[
+                            "effective_global_batch_size"
+                        ],
+                        "optimizer_updates_per_epoch": optimizer_updates_by_epoch,
+                        "total_optimizer_steps": planned_total_steps,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
 
         # All workers build identical initial weights; rank-specific RNG streams
         # are installed after construction and restored from rank-local checkpoints.
@@ -871,10 +934,11 @@ def run(args: argparse.Namespace) -> int:
                     if optimizer_steps_by_epoch[candidate_epoch] >= args.stop_after_step:
                         progress_final_epoch = candidate_epoch
                         break
-        progress_total_steps = max(
-            optimizer_step,
-            optimizer_steps_by_epoch[progress_final_epoch],
-        )
+        progress_total_steps = max(optimizer_step, optimizer_steps_by_epoch[progress_final_epoch])
+        if progress_total_steps <= 0:
+            raise RuntimeError(
+                "Resolved progress total is zero; refusing to start with a 0/0 optimizer-step bar"
+            )
 
         identifiers, test_puzzles = _load_evaluation_artifacts(dataset_dir)
         diagnostics = None
@@ -902,7 +966,7 @@ def run(args: argparse.Namespace) -> int:
                         "dataset_manifest": manifest,
                         "runtime_environment": _runtime_environment(device, world_size),
                         "batch_sizes": batch_plan,
-                        "estimated_optimizer_steps": estimated_total_steps,
+                        "planned_optimizer_steps": planned_total_steps,
                         "progress_optimizer_updates_per_epoch": optimizer_updates_by_epoch,
                         "progress_total_optimizer_steps": progress_total_steps,
                         "model_parameter_count": sum(
@@ -928,7 +992,7 @@ def run(args: argparse.Namespace) -> int:
                 )
                 stream.flush()
 
-        if not args.resume:
+        if not args.resume and args.smoke_test_steps is None:
             save_checkpoint(
                 run_dir=run_dir,
                 model=loss_model,
@@ -948,13 +1012,122 @@ def run(args: argparse.Namespace) -> int:
 
         if rank == 0:
             progress = TrainingProgress(
-                total_steps=progress_total_steps,
+                total_steps=(
+                    args.smoke_test_steps
+                    if args.smoke_test_steps is not None
+                    else progress_total_steps
+                ),
                 initial_step=optimizer_step,
                 initial_epoch=min(int(config["epochs"]), completed_epochs + 1),
                 total_epochs=int(config["epochs"]),
             )
 
         metrics_path = run_dir / "metrics.jsonl"
+        if args.smoke_test_steps is not None:
+            smoke_memory_path = run_dir / "smoke_memory.jsonl"
+            accumulation_steps = int(config["optimization"]["gradient_accumulation_steps"])
+            if torch.cuda.is_available():
+                torch.cuda.reset_peak_memory_stats(device)
+            last_memory_record: dict[str, int] | None = None
+
+            def record_smoke_step(update: dict[str, Any]) -> None:
+                nonlocal last_memory_record
+                if progress is not None:
+                    progress.optimizer_step(update)
+                torch.cuda.synchronize(device)
+                peak_memory = torch.tensor(
+                    [
+                        torch.cuda.max_memory_allocated(device),
+                        torch.cuda.max_memory_reserved(device),
+                    ],
+                    dtype=torch.int64,
+                    device="cpu",
+                )
+                if world_size > 1:
+                    dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX, group=cpu_group)
+                values = peak_memory.tolist()
+                last_memory_record = {
+                    "peak_allocated_bytes_max_rank": int(values[0]),
+                    "peak_reserved_bytes_max_rank": int(values[1]),
+                }
+                if rank == 0:
+                    memory_record = {
+                        "event": "smoke_optimizer_step",
+                        "optimizer_step": int(update["optimizer_step"]),
+                        "training_loss": float(update["training_loss"]),
+                        "learning_rate": float(update["learning_rate"]),
+                        "examples": int(update["examples"]),
+                        "world_size": world_size,
+                        **last_memory_record,
+                    }
+                    _append_jsonl(smoke_memory_path, memory_record)
+                    if progress is not None:
+                        progress.write(json.dumps(memory_record, sort_keys=True))
+                torch.cuda.reset_peak_memory_stats(device)
+
+            try:
+                smoke_result = train_one_epoch(
+                    model=loss_model,
+                    loader=islice(
+                        train_loader,
+                        int(args.smoke_test_steps) * accumulation_steps,
+                    ),
+                    optimizers=optimizers,
+                    optimizer_base_lrs=optimizer_base_lrs,
+                    device=device,
+                    carry=None,
+                    optimizer_step=optimizer_step,
+                    total_steps=planned_total_steps,
+                    warmup_steps=int(config["optimization"]["lr_warmup_steps"]),
+                    min_lr_ratio=float(config["optimization"]["lr_min_ratio"]),
+                    global_batch_size=global_batch_size,
+                    accumulation_steps=accumulation_steps,
+                    gradient_clip_norm=config["optimization"].get("gradient_clip_norm"),
+                    rank=rank,
+                    world_size=world_size,
+                    epoch=completed_epochs + 1,
+                    vocab_size=int(config["model"]["vocab_size"]),
+                    num_puzzle_identifiers=int(config["model"]["num_puzzle_identifiers"]),
+                    on_optimizer_step=record_smoke_step,
+                )
+            except torch.cuda.OutOfMemoryError as exc:
+                torch.cuda.empty_cache()
+                raise RuntimeError(
+                    f"CUDA out of memory in {config['operator']} smoke test on rank={rank}, "
+                    f"per_device_batch_size={batch_plan['per_device_batch_size']}, "
+                    f"global_batch_size={global_batch_size}, "
+                    f"gradient_accumulation_steps={accumulation_steps}. "
+                    "The torchrun worker agent will stop the peer ranks; retry with the "
+                    "smaller explicit per-device-batch preset."
+                ) from exc
+            completed_smoke_steps = smoke_result.optimizer_step - optimizer_step
+            if completed_smoke_steps != int(args.smoke_test_steps):
+                raise RuntimeError(
+                    f"Smoke test requested {args.smoke_test_steps} optimizer steps but "
+                    f"the loader completed {completed_smoke_steps}; check the dataset and "
+                    "accumulation configuration."
+                )
+            if rank == 0:
+                summary = {
+                    "event": "smoke_test_completed",
+                    "optimizer_steps": completed_smoke_steps,
+                    "examples_sampled": smoke_result.examples_sampled,
+                    "world_size": world_size,
+                    "per_device_batch_size": batch_plan["per_device_batch_size"],
+                    "global_batch_size": global_batch_size,
+                    "gradient_accumulation_steps": accumulation_steps,
+                    "memory_log": str(smoke_memory_path),
+                    **(last_memory_record or {}),
+                }
+                _append_jsonl(metrics_path, summary)
+                with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(summary, sort_keys=True) + "\n")
+                    stream.flush()
+                if progress is not None:
+                    progress.write(json.dumps(summary, sort_keys=True))
+                progress_status = "smoke-complete"
+            return 0
+
         for epoch in range(completed_epochs + 1, int(config["epochs"]) + 1):
             if torch.cuda.is_available():
                 torch.cuda.reset_peak_memory_stats(device)
@@ -968,7 +1141,7 @@ def run(args: argparse.Namespace) -> int:
                     device=device,
                     carry=carry,
                     optimizer_step=optimizer_step,
-                    total_steps=estimated_total_steps,
+                    total_steps=planned_total_steps,
                     warmup_steps=int(config["optimization"]["lr_warmup_steps"]),
                     min_lr_ratio=float(config["optimization"]["lr_min_ratio"]),
                     global_batch_size=global_batch_size,
@@ -987,11 +1160,12 @@ def run(args: argparse.Namespace) -> int:
             except torch.cuda.OutOfMemoryError as exc:
                 torch.cuda.empty_cache()
                 raise RuntimeError(
-                    f"CUDA out of memory in {config['operator']} training at "
+                    f"CUDA out of memory in {config['operator']} training on rank={rank} at "
                     f"epoch={epoch}, per_device_batch_size={batch_plan['per_device_batch_size']}, "
                     f"global_batch_size={global_batch_size}, "
                     f"gradient_accumulation_steps={batch_plan['gradient_accumulation_steps']}. "
-                    "Reduce the configured per-device batch size and rebuild the run config."
+                    "The torchrun worker agent will stop the peer ranks. Reduce the "
+                    "configured per-device batch size in an explicit run preset and retry."
                 ) from exc
             if epoch_result.examples_sampled <= 0:
                 raise RuntimeError(
@@ -1008,6 +1182,13 @@ def run(args: argparse.Namespace) -> int:
                     progress.write(message)
                 else:
                     print(message, flush=True)
+            if actual_epoch_updates != predicted_epoch_updates:
+                optimizer_updates_by_epoch[epoch - 1] = actual_epoch_updates
+                optimizer_steps_by_epoch = [0]
+                for updates in optimizer_updates_by_epoch:
+                    optimizer_steps_by_epoch.append(optimizer_steps_by_epoch[-1] + updates)
+                planned_total_steps = optimizer_steps_by_epoch[-1]
+                config["estimated_total_optimizer_steps"] = planned_total_steps
             carry = epoch_result.carry
             optimizer_step = epoch_result.optimizer_step
             if args.stop_after_step is not None and optimizer_step >= args.stop_after_step:
@@ -1259,6 +1440,14 @@ def parse_args() -> argparse.Namespace:
         "--stop-after-step",
         type=int,
         help="Stop at the first completed epoch boundary at or after this optimizer step",
+    )
+    parser.add_argument(
+        "--smoke-test-steps",
+        type=int,
+        help=(
+            "Run this many optimizer updates from a fresh model, skip validation and "
+            "checkpoints, and log peak memory for a bounded forward/backward test"
+        ),
     )
     return parser.parse_args()
 

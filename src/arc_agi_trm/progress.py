@@ -31,6 +31,8 @@ class TrainingProgress:
         initial_epoch: int = 0,
         tqdm_factory=None,
     ) -> None:
+        if total_steps <= 0:
+            raise ValueError("Training progress total_steps must be positive")
         if tqdm_factory is None:
             try:
                 from tqdm.auto import tqdm as tqdm_factory
@@ -62,7 +64,6 @@ class TrainingProgress:
         self._example_samples.append((self._start_time, 0))
         self._examples = 0
         self._last_step_time = self._start_time
-        self._last_completed_metrics: dict[str, float] = {}
         self._last_loss: float | None = None
         self._last_learning_rate: float | None = None
         self._closed = False
@@ -103,13 +104,6 @@ class TrainingProgress:
             "ex/s": f"{examples_per_second:.1f}" if examples_per_second else "?",
             "eta~": eta,
         }
-        for key, label in (
-            ("training_grid_accuracy", "grid(last)"),
-            ("training_batch_exact_accuracy", "exact(last)"),
-        ):
-            value = self._last_completed_metrics.get(key)
-            if value is not None and math.isfinite(value):
-                result[label] = f"{value:.1%}"
         return result
 
     def optimizer_step(self, step: Mapping[str, Any]) -> None:
@@ -139,11 +133,6 @@ class TrainingProgress:
     def epoch_completed(self, epoch: int, metrics: Mapping[str, Any]) -> None:
         if self._closed:
             return
-        self._last_completed_metrics = {
-            key: float(metrics[key])
-            for key in ("training_grid_accuracy", "training_batch_exact_accuracy")
-            if metrics.get(key) is not None
-        }
         self._bar.set_description(f"Epoch {epoch}/{self.total_epochs}")
         self._bar.set_postfix(
             self._postfix(loss=self._last_loss, learning_rate=self._last_learning_rate),
@@ -161,11 +150,10 @@ class TrainingProgress:
         else:
             self._tqdm.write(message)
 
-    def close(self, *, final_step: int, status: str) -> None:
+    def close(self, *, final_step: int, status: str | None = None) -> None:
         if self._closed:
             return
         self._bar.total = max(0, int(final_step))
-        self._bar.set_postfix({"status": status}, refresh=True)
         self._bar.refresh()
         self._bar.close()
         self._closed = True

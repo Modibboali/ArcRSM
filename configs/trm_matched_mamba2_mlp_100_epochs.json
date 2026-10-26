@@ -1,7 +1,17 @@
 {
-  "base": "mamba2_mlp_base.json",
+  "base": "trm_baseline_100_epochs.json",
   "operator": "attention",
+  "expected_world_size": 4,
+  "seed": 42,
   "name": "trm-matched-mamba2-mlp-100",
   "epochs": 100,
-  "run_dir": "outputs/trm-matched-mamba2-mlp-100"
+  "run_dir": "outputs/trm-matched-mamba2-mlp-100",
+  "model": {
+    "L_cycles": 4
+  },
+  "optimization": {
+    "global_batch_size": 32,
+    "expected_per_device_batch_size": 8,
+    "gradient_accumulation_steps": 1
+  }
 }

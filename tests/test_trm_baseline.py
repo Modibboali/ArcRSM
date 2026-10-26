@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from arc_agi_trm import build_trm, load_pretrained_model, save_pretrained
@@ -14,7 +15,7 @@ from arc_agi_trm.progress import TrainingProgress
 from arc_agi_trm.runner import estimate_train_optimizer_updates
 from models.losses import ACTLossHead
 from puzzle_dataset import PuzzleDataset, PuzzleDatasetConfig
-from scripts.train_mamba2_hybrid import _load_resume, _save_checkpoint
+from scripts.train_mamba2_hybrid import _load_resume, _save_checkpoint, _validate_config
 from test_trm_smoke import synthetic_batch, tiny_config
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -123,11 +124,10 @@ def test_original_trm_optimizer_progress_and_pretrained_checkpoint_roundtrip(tmp
         1,
         {"training_grid_accuracy": 0.5, "training_batch_exact_accuracy": 0.25},
     )
-    assert "grid(last)" in bar.postfix
-    assert "exact(last)" in bar.postfix
+    assert set(bar.postfix) == {"loss", "lr", "ex/s", "eta~"}
     progress.close(final_step=1, status="complete")
     assert bar.closed
-    assert bar.postfix == {"status": "complete"}
+    assert set(bar.postfix) == {"loss", "lr", "ex/s", "eta~"}
 
     config = {
         "operator": "attention",
@@ -251,6 +251,8 @@ def test_optimizer_update_count_matches_actual_upstream_sampler_epochs():
         epochs=4,
         accumulation_steps=2,
     )
+    assert all(updates > 0 for updates in expected)
+    assert sum(expected) > 0
     assert dataset._iters == 0
 
     actual = []
@@ -267,10 +269,36 @@ def test_original_and_matched_baseline_presets_are_distinct():
     )
 
     assert faithful["operator"] == matched["operator"] == "attention"
+    assert faithful["expected_world_size"] == matched["expected_world_size"] == 4
     assert faithful["model"]["L_cycles"] == 6
     assert faithful["model"]["pos_encodings"] == "rope"
     assert faithful["optimization"]["global_batch_size"] == 768
+    assert faithful["optimization"]["expected_per_device_batch_size"] == 192
     assert matched["model"]["L_cycles"] == 4
-    assert matched["model"]["pos_encodings"] == "none"
+    assert matched["model"]["pos_encodings"] == "rope"
+    assert matched["seed"] == 42
     assert matched["optimization"]["global_batch_size"] == 32
+    assert matched["optimization"]["expected_per_device_batch_size"] == 8
+    assert matched["optimization"]["gradient_accumulation_steps"] == 1
     assert faithful["epochs"] == matched["epochs"] == 100
+
+    plan = _validate_config(matched, world_size=4)
+    assert plan["per_device_batch_size"] == 8
+    assert plan["microbatch_global_size"] == 32
+    assert plan["gradient_accumulation_steps"] == 1
+    assert plan["effective_global_batch_size"] == 32
+
+    with pytest.raises(ValueError, match="expects world_size=4"):
+        _validate_config(matched, world_size=1)
+
+    mismatched = {**matched, "optimization": dict(matched["optimization"])}
+    mismatched["optimization"]["global_batch_size"] = 768
+    with pytest.raises(ValueError, match="resolves to 192 examples per rank"):
+        _validate_config(mismatched, world_size=4)
+
+    smaller = load_experiment_config(
+        PROJECT_ROOT / "configs" / "trm_matched_mamba2_mlp_100_epochs_bs4.json"
+    )
+    smaller_plan = _validate_config(smaller, world_size=4)
+    assert smaller_plan["per_device_batch_size"] == 4
+    assert smaller_plan["effective_global_batch_size"] == 32

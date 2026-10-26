@@ -1,120 +1,140 @@
 # Original TRM baseline and training progress
 
-## Architecture presets
+## Why the first run used batch 192 per GPU
 
-`configs/trm_baseline_100_epochs.json` selects `operator: "attention"` and uses
-the vendored upstream TRM block implementation. Its model settings match
-`external/TinyRecursiveModels/config/arch/trm.yaml`: H/L cycles 3/6, two shared
-blocks, hidden size 512, eight heads, expansion 4, RoPE, bf16, 16 puzzle
-embedding tokens, and the upstream ACT defaults. Its optimizer settings follow
-the upstream pretraining config. The 100-epoch budget, ARC-AGI-2 dataset split,
-and checkpoint/evaluation intervals are the project run policy.
+`global_batch_size` is the aggregate microbatch across all distributed ranks.
+The trainer resolves it as:
 
-`configs/trm_matched_mamba2_mlp_100_epochs.json` layers over the existing
-Mamba-2 MLP base and changes the operator to `attention`. It keeps the Mamba
-experiment's seed, dataset, batch size, model dimensions, schedule, and other
-applicable settings. Its Mamba-specific config values remain unused; selecting
-`attention` returns the upstream model before importing the project Mamba
-operator module.
-
-The CLI already selects architecture through the config's `operator` field:
-
-- `attention`: original upstream TRM, with its original `L_level.layers`.
-- `mamba2_attention` or `mamba2_mlp`: existing Mamba replacements.
-
-No Mamba package is imported or block instantiated by `operator: "attention"`.
-The trainer still uses the upstream sparse embedding optimizer and the
-configured dense optimizer, which are independent of Mamba.
-
-## Four-GPU Kaggle launch
-
-From the repository root, run the faithful upstream baseline with fresh state:
-
-```bash
-torchrun --standalone --nproc_per_node=4 scripts/train_mamba2_hybrid.py \
-  --config configs/trm_baseline_100_epochs.json \
-  --dataset /kaggle/working/data/arc2-mamba2-aug1000 \
-  --run-dir /kaggle/working/outputs/trm-baseline-100
+```text
+per_device_batch_size = global_batch_size / world_size
+effective_global_batch_size = global_batch_size * gradient_accumulation_steps
 ```
 
-This command does not pass `--resume` or `--init-from`. Do not start it until
-the selected output directory is available for a fresh run. The matched
-comparison uses `configs/trm_matched_mamba2_mlp_100_epochs.json` and a separate
-`--run-dir`.
+The original upstream-faithful preset specified `global_batch_size: 768` and
+the Kaggle launch used four ranks, so the standalone attention TRM received
+192 examples per GPU. With accumulation 1, its effective update batch was
+768. `model.batch_size` is set from this resolved per-device value because the
+upstream model uses it to size its local sparse-embedding buffers. The
+configuration now records an expected world size and expected per-device
+batch; startup rejects a mismatch and prints the resolved values before model
+construction.
 
-## Progress and ETA
+The failed run's 192-example allocation explains the reported CUDA OOM during
+the RoPE attention forward. The faithful preset retains that historical batch
+setting and remains separately identifiable as
+`trm-upstream-faithful-100`; it is not the L4 comparison preset.
 
-Rank zero owns one tqdm bar; other ranks do not create a progress display. The
-bar advances only after a completed optimizer update, including a short final
-gradient-accumulation window. It shows epoch, optimizer step/total, the current
-accumulation-window loss, learning rate, recent examples per second, elapsed
-time, and a rolling `eta~` estimate. Grid and exact accuracy are labeled
-`grid(last)` and `exact(last)` and refer to the last completed epoch.
+## Matched standalone TRM preset
 
-The upstream `PuzzleDataset` is iterable-only and has no loader length. The
-trainer therefore counts the exact yields from the upstream sampler's group
-indices, per-epoch Philox shuffle, puzzle selection, batch packing, and final
-partial-batch drop. It then converts batches to updates with
-`ceil(batch_count / gradient_accumulation_steps)` for each epoch. This planning
-pass does not consume the sampler's process-global NumPy RNG or advance its
-resume counter. The total honors the epoch budget and the existing
-`--stop-after-step` epoch-boundary behavior. Observed epoch update counts revise
-the ETA plan if a future sampler change makes the count differ. ETA is
-explicitly approximate and uses the rolling duration of recent optimizer
-updates; compilation, optimizer warmup, checkpointing, validation, and slower
-early updates affect the estimate as their time enters the rolling window. The
-bar starts after model setup and the initial checkpoint, and shows `eta~=?`
-until it has observed an optimizer update.
+Use `configs/trm_matched_mamba2_mlp_100_epochs.json` for the stable comparison
+run. It layers over the faithful upstream TRM preset and changes the seed to
+42, L cycles to 4 to match the Mamba2-MLP experiment, and the batch settings.
+The dataset, model dimensions, optimizer values, epochs, and evaluation policy
+match the Mamba2-MLP experiment where applicable. It keeps the original TRM
+RoPE setting and upstream attention blocks, normalization, initialization,
+recurrence, carry, ACT/halting, sparse puzzle embedding, and output heads.
+Selecting `operator: "attention"` builds the vendored upstream TRM model and
+does not import or instantiate a Mamba block.
 
-Epoch JSON metrics remain in `metrics.jsonl` and `run.log`. The normal progress
-bar does not show tensor or per-layer diagnostics.
+Resolved settings with four GPUs:
 
-## CPU smoke test
+| Setting | Matched preset |
+| --- | ---: |
+| World size | 4 |
+| Per-device batch size | 8 |
+| Global microbatch | 32 |
+| Gradient accumulation | 1 |
+| Effective global batch per optimizer update | 32 |
+| Seed | 42 |
+| Epochs | 100 |
+| Position encoding | Upstream RoPE |
 
-Run this short test from the repository root:
+If the four-GPU smoke test still OOMs at 8 per device, retry with
+`configs/trm_matched_mamba2_mlp_100_epochs_bs4.json`. That explicit fallback
+uses per-device batch 4, global microbatch 16, and accumulation 2, keeping the
+effective update batch at 32. It does not change batch sizes after a run
+starts.
+
+## Four-GPU smoke test
+
+Run from the repository root on the four-GPU Kaggle machine. The smoke option
+does exactly two optimizer updates, skips validation and checkpoint writes,
+and records the maximum allocated and reserved memory across ranks after each
+update in `smoke_memory.jsonl`. `metrics.jsonl` and `run.log` receive a
+structured completion record. Use a fresh smoke output directory.
+
+```bash
+torchrun --standalone --max-restarts=0 --nproc_per_node=4 scripts/train_mamba2_hybrid.py \
+  --config configs/trm_matched_mamba2_mlp_100_epochs.json \
+  --dataset /kaggle/working/data/arc2-mamba2-aug1000 \
+  --run-dir /kaggle/working/outputs/trm-baseline-smoke-bs8 \
+  --smoke-test-steps 2
+```
+
+If that reports CUDA OOM, retry the smaller configured microbatch:
+
+```bash
+torchrun --standalone --max-restarts=0 --nproc_per_node=4 scripts/train_mamba2_hybrid.py \
+  --config configs/trm_matched_mamba2_mlp_100_epochs_bs4.json \
+  --dataset /kaggle/working/data/arc2-mamba2-aug1000 \
+  --run-dir /kaggle/working/outputs/trm-baseline-smoke-bs4 \
+  --smoke-test-steps 2
+```
+
+Both commands use `torchrun` with restarts disabled. A rank that hits CUDA OOM
+reports its rank and resolved batch, exits with failure, and lets the torchrun
+worker agent stop and reap the other local ranks. The trainer also destroys
+the process group during normal exception cleanup. No allocator setting is
+used as a substitute for reducing the configured microbatch.
+
+## Full comparison run
+
+After the smoke test completes without OOM, the full matched run command is:
+
+```bash
+torchrun --standalone --max-restarts=0 --nproc_per_node=4 scripts/train_mamba2_hybrid.py \
+  --config configs/trm_matched_mamba2_mlp_100_epochs.json \
+  --dataset /kaggle/working/data/arc2-mamba2-aug1000 \
+  --run-dir /kaggle/working/outputs/trm-baseline-matched-100
+```
+
+The 100-epoch command is documented but has not been launched. The faithful
+historical preset remains available at
+`configs/trm_baseline_100_epochs.json`; on four GPUs its explicit resolution
+is 192 examples per device, 768 global, accumulation 1.
+
+## Progress total and logs
+
+The upstream `PuzzleDataset` is iterable-only and has no loader length. Before
+constructing the model, the trainer counts the exact upstream sampler yields
+from the dataset group indices, per-epoch Philox shuffle, puzzle selection,
+batch packing, and dropped final partial batch. It converts each epoch's batch
+count to optimizer updates with
+`ceil(batch_count / gradient_accumulation_steps)`. The global batch passed to
+the loader already reflects the resolved world-size plan. It refuses to
+create a progress bar if any epoch has zero planned updates, so a broken plan
+cannot display `0/0 opt`. The plan is included in the startup JSON and
+`config_snapshot.json`; each completed epoch checks the prediction against the
+actual loader and corrects later totals if needed.
+
+Only rank zero creates tqdm. It displays epoch/total epochs, completed/total
+optimizer steps, training loss, learning rate, recent examples per second,
+elapsed time, and approximate ETA. Gradient accumulation's final short
+window counts as an optimizer update. Epoch summaries remain in `metrics.jsonl`
+and `run.log`.
+
+## Local verification
+
+Run the CPU tests from the repository root:
 
 ```bash
 .venv/Scripts/python.exe -m pytest -q tests/test_trm_baseline.py
 ```
 
-It blocks Mamba imports while constructing the upstream attention model, runs
-one CPU forward/backward/optimizer update with finite loss and gradients,
-exercises the progress display interface, round-trips both training/resume and
-model-only inference checkpoints, and compares planned optimizer updates with
-actual upstream sampler epochs. The progress unit test uses a tiny
-tqdm-compatible test double; actual training uses the pinned `tqdm==4.67.1` dependency in
-`requirements/kaggle-training.txt`.
-
-## Existing runs and numerical diagnostics
-
-The source edits affect newly launched Python processes. A running Python
-process already has its imported model and trainer code in memory; this work
-does not signal, edit, or stop it. On Kaggle, inspect a live run without
-interrupting it:
-
-```bash
-ps -eo pid,etime,args | grep '[t]rain_mamba2_hybrid.py'
-PID=1234  # replace with the PID from the previous command
-ps -p "$PID" -o pid,etime,args
-tr '\0' ' ' < "/proc/$PID/cmdline"; echo
-```
-
-Use the command's `--run-dir` and `--config` values to check its recorded
-identity (set `RUN_DIR` to the process's `--run-dir`, or its config's default):
-For older processes launched with a `--run-dir` override, the command line is
-authoritative because their snapshot may contain only the preset's default
-directory.
-
-```bash
-RUN_DIR=/kaggle/working/outputs/trm-baseline-100
-jq '{name: .experiment.name, operator: .experiment.operator, run_dir: .experiment.run_dir}' \
-  "$RUN_DIR/config_snapshot.json"
-tail -n 1 "$RUN_DIR/metrics.jsonl"
-ls "$RUN_DIR"/numerics_rank*.jsonl 2>/dev/null
-```
-
-Diagnostic JSONL files are created only when `--diagnose-numerics` is enabled.
-That opt-in mode checks tensors, gradients, parameters, optimizer state, and
-distributed synchronization, and can substantially reduce training
-throughput. Leave the flag off for normal performance runs; it is off by
-default.
+These tests exercise the original upstream attention block without importing
+Mamba, run a CPU forward/backward/optimizer update, check progress fields,
+round-trip checkpoints, compare planned counts with actual upstream sampler
+epochs, and assert both batch presets resolve as configured. The real
+four-GPU forward/backward memory smoke test and CUDA OOM worker shutdown still
+need to run on Kaggle. Do not launch the 100-epoch command until the smoke test
+passes.

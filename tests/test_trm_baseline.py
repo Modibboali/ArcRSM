@@ -140,7 +140,17 @@ def test_original_trm_optimizer_progress_and_pretrained_checkpoint_roundtrip(tmp
     bar = _ProgressBar.instances[-1]
     assert bar.n == bar.total == 1
     assert bar.description == "TRM | Epoch 1/1 | Steps 1/1"
-    for field in ("Loss", "Grid", "Exact", "LR", "ex/s", "Elapsed", "ETA ~"):
+    for field in (
+        "Loss avg30",
+        "LM avg30",
+        "Qh avg30",
+        "Grid",
+        "Exact",
+        "LR",
+        "ex/s",
+        "Elapsed",
+        "ETA ~",
+    ):
         assert field in bar.postfix
     assert "Val loss" not in bar.postfix
     assert "Val exact" not in bar.postfix

@@ -369,6 +369,12 @@ def train_one_epoch(
                     diagnostics.record_q_head_optimizer_state(
                         optimizer, model, phase="immediately_before_optimizer_step"
                     )
+                    diagnostics.record_adam_atan2_square_overflow_risk(
+                        optimizer, model
+                    )
+                    diagnostics.synchronize(
+                        "optimizer_update_input_validation", device=device
+                    )
                 optimizer.step()
                 if diagnostics is not None and optimizer_index == 1:
                     diagnostics.record_q_head_optimizer_state(
@@ -390,12 +396,16 @@ def train_one_epoch(
             diagnostics.synchronize("after_optimizer_update", device=device)
 
         if on_optimizer_step is not None:
+            loss_component_names = sorted(
+                name for name in accumulated_metric_sums if name.endswith("_loss")
+            )
             step_statistics = torch.tensor(
                 [
                     accumulated_loss_local,
                     accumulated_metric_sums.get("count", 0.0),
                     accumulated_metric_sums.get("accuracy", 0.0),
                     accumulated_metric_sums.get("exact_accuracy", 0.0),
+                    *(accumulated_metric_sums[name] for name in loss_component_names),
                 ],
                 dtype=torch.float64,
                 device=device,
@@ -403,6 +413,11 @@ def train_one_epoch(
             if world_size > 1:
                 dist.all_reduce(step_statistics, op=dist.ReduceOp.SUM)
             metric_count = max(0.0, float(step_statistics[1].item()))
+            training_loss_components = {
+                name: float(step_statistics[4 + index].item())
+                / max(1, accumulated_global_examples)
+                for index, name in enumerate(loss_component_names)
+            }
             on_optimizer_step(
                 {
                     "epoch": epoch,
@@ -414,6 +429,7 @@ def train_one_epoch(
                     "training_batch_exact_accuracy": float(step_statistics[3].item())
                     / max(1.0, metric_count),
                     "training_metric_count": metric_count,
+                    "training_loss_components": training_loss_components,
                     "learning_rate": last_lr,
                     "examples": accumulated_global_examples,
                 }
@@ -441,7 +457,9 @@ def train_one_epoch(
             raise RuntimeError("Sampler emitted an empty training batch")
         batch = {key: value.to(device, non_blocking=True) for key, value in source_batch.items()}
         if diagnostics is not None:
-            diagnostics.set_context(epoch=epoch, optimizer_step=optimizer_step, batch=batch)
+            diagnostics.set_context(
+                epoch=epoch, optimizer_step=optimizer_step + 1, batch=batch
+            )
             diagnostics.check_batch(
                 batch,
                 vocab_size=vocab_size if vocab_size is not None else 2**31 - 1,
@@ -467,15 +485,28 @@ def train_one_epoch(
                     l_cycles=model_config.L_cycles,
                     l_layers=model_config.L_layers,
                 )
-        carry, loss, metrics, _outputs, _all_finished = model(
+        return_keys = (
+            ("logits", "preds", "q_halt_logits", "q_continue_logits", "target_q_continue")
+            if diagnostics is not None
+            else ()
+        )
+        carry, loss, metrics, outputs, _all_finished = model(
             carry=carry,
             batch=batch,
-            return_keys=(),
+            return_keys=return_keys,
         )
         if diagnostics is None:
             assert_finite_tensor(loss, "training loss")
         else:
+            diagnostics.record_loss_batch(
+                loss=loss,
+                metrics=metrics,
+                outputs=outputs,
+                batch=batch,
+                model=model,
+            )
             diagnostics.check_tree("carry", carry, stage="forward")
+            diagnostics.check_tree("model_outputs", outputs, stage="forward")
             for key, value in metrics.items():
                 diagnostics.check_tensor(f"loss_component.{key}", value, stage="forward")
             diagnostics.check_tensor("loss.total", loss, stage="forward")
@@ -497,6 +528,11 @@ def train_one_epoch(
             diagnostics.finish_recursion_forward()
             check_gradients("after_backward")
             diagnostics.synchronize("after_backward", device=device)
+            diagnostics.record_model_gradients(
+                model,
+                optimizers,
+                phase="immediately_after_backward_before_reduction",
+            )
         if accumulation_steps > 1:
             for optimizer, parts in sparse_parts.values():
                 _weights, local_weights, local_ids = parts

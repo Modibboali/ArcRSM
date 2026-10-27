@@ -84,6 +84,31 @@ def test_model_construction_carry_forward_loss_and_backward() -> None:
     assert model.inner.embed_tokens.embedding_weight.grad is not None
 
 
+def test_upstream_act_continuation_target_is_detached_and_uses_weighted_bce() -> None:
+    config = tiny_config()
+    config["no_ACT_continue"] = False
+    model = build_trm(config, operator="attention")
+    loss_model = ACTLossHead(model, loss_type="stablemax_cross_entropy")
+    batch = synthetic_batch()
+
+    _carry, loss, metrics, outputs, _finished = loss_model(
+        carry=loss_model.initial_carry(batch),
+        batch=batch,
+        return_keys=("q_halt_logits", "q_continue_logits", "target_q_continue"),
+    )
+
+    assert outputs is not None
+    assert outputs["q_halt_logits"].shape == (2,)
+    assert outputs["q_continue_logits"].shape == (2,)
+    assert outputs["target_q_continue"].shape == (2,)
+    assert not outputs["target_q_continue"].requires_grad
+    assert "q_continue_loss" in metrics
+    expected = metrics["lm_loss"] + 0.5 * (
+        metrics["q_halt_loss"] + metrics["q_continue_loss"]
+    )
+    assert torch.equal(loss.detach(), expected)
+
+
 def test_only_final_full_recursion_tracks_gradients() -> None:
     model = build_trm(tiny_config())
     batch = synthetic_batch()

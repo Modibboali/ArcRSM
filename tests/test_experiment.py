@@ -593,6 +593,93 @@ def test_mamba2_mlp_hooks_capture_actual_shared_layer_calls(tmp_path) -> None:
     )
     assert after_step["optimizer_class"] == "AdamW"
     assert after_step["fields"]["exp_avg_sq"]["finite_count"] == 2 * 32
+    training_records = [
+        json.loads(line)
+        for line in (tmp_path / "training_diagnostics_rank0.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    loss_record = next(
+        item for item in training_records if item["event"] == "loss_batch_before_backward"
+    )
+    assert loss_record["raw_backward_loss"]["shape"] == []
+    assert loss_record["loss_components"]["lm_loss"]["shape"] == []
+    assert loss_record["outputs"]["prediction_logits"]["shape"] == [2, 9, 12]
+    assert loss_record["outputs"]["q_tensors"]["q_halt_logits"]["shape"] == [2]
+    assert loss_record["batch_reductions"]["halt_loss_mask"] is None
+    assert any(item["event"] == "q_head_forward" for item in training_records)
+    assert any(item["event"] == "q_head_activation_gradient" for item in training_records)
+
+
+def test_adam_atan2_gradient_square_overflow_is_blocked_before_optimizer_step(tmp_path) -> None:
+    class AdamATan2(torch.optim.SGD):
+        def __init__(self, parameters):
+            super().__init__(parameters, lr=0.1)
+            self.step_calls = 0
+
+        def step(self, closure=None):
+            self.step_calls += 1
+            return super().step(closure)
+
+    class QHeadLossModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.inner = torch.nn.Module()
+            self.inner.q_head = torch.nn.Linear(512, 2, bias=False)
+
+        def initial_carry(self, _batch):
+            return None
+
+        def forward(self, *, carry, batch, return_keys):
+            loss = self.inner.q_head.weight.sum() * 1.0e20
+            return carry, loss, {"lm_loss": loss.detach()}, None, torch.tensor(True)
+
+    model = QHeadLossModel()
+    unrelated = torch.nn.Parameter(torch.zeros(()))
+    optimizers = [
+        torch.optim.SGD([unrelated], lr=0.0),
+        AdamATan2(model.parameters()),
+    ]
+    diagnostics = NumericsDiagnostics(
+        rank=0,
+        world_size=1,
+        log_path=tmp_path / "numerics_rank0.jsonl",
+        detailed_step_range=(1, 1),
+    )
+    batch = {
+        "inputs": torch.tensor([[1, 2]]),
+        "labels": torch.tensor([[2, 3]]),
+        "puzzle_identifiers": torch.tensor([1]),
+    }
+
+    with pytest.raises(FloatingPointError, match="overflow_if_squared"):
+        train_one_epoch(
+            model=model,
+            loader=[("all", batch, 1)],
+            optimizers=optimizers,
+            optimizer_base_lrs=[0.0, 0.1],
+            device=torch.device("cpu"),
+            carry=None,
+            optimizer_step=0,
+            total_steps=1,
+            warmup_steps=0,
+            min_lr_ratio=1.0,
+            global_batch_size=1,
+            diagnostics=diagnostics,
+            epoch=1,
+        )
+
+    assert optimizers[1].step_calls == 0
+    record = json.loads(
+        (tmp_path / "numerics_rank0.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()[0]
+    )
+    assert record["tensor_name"].endswith("q_head.weight.squared_for_exp_avg_sq")
+    assert record["failure_kind"] == "overflow_if_squared"
+    assert record["overflow_count"] == 2 * 512
+    assert record["max_abs_gradient"] == pytest.approx(1.0e20)
+    assert "grad * grad" in record["first_invalid_operation"]
 
 
 def test_train_diagnostics_stop_before_backward_on_nonfinite_loss(tmp_path) -> None:
@@ -643,7 +730,7 @@ def test_train_diagnostics_stop_before_backward_on_nonfinite_loss(tmp_path) -> N
         (tmp_path / "train-numerics.jsonl").read_text(encoding="utf-8").splitlines()[0]
     )
     assert record["epoch"] == 7
-    assert record["optimizer_step"] == 0
+    assert record["optimizer_step"] == 1
     assert record["tensor_name"] == "loss_component.lm_loss"
 
 

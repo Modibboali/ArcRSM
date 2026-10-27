@@ -27,12 +27,25 @@ class NumericsDiagnostics:
         cpu_group=None,
         log_path: str | Path | None = None,
         puzzle_names: list[str] | None = None,
+        detailed_step_range: tuple[int, int] | None = None,
     ) -> None:
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.cpu_group = cpu_group
         self.log_path = Path(log_path) if log_path is not None else None
         self.puzzle_names = puzzle_names
+        if detailed_step_range is not None:
+            first_step, last_step = (int(value) for value in detailed_step_range)
+            if first_step < 1 or last_step < first_step:
+                raise ValueError("detailed_step_range must be a positive inclusive range")
+            self.detailed_step_range = (first_step, last_step)
+        else:
+            self.detailed_step_range = None
+        self.training_log_path = (
+            self.log_path.with_name(f"training_diagnostics_rank{self.rank}.jsonl")
+            if self.log_path is not None
+            else None
+        )
         self.epoch = 0
         self.optimizer_step = 0
         self.batch_ids: list[int] = []
@@ -51,6 +64,7 @@ class NumericsDiagnostics:
         self.current_recursion_call: dict[str, Any] | None = None
         self.invocation_by_module: dict[str, int] = {}
         self.invocations: list[dict[str, Any]] = []
+        self.q_head_forward_call_index = 0
 
     @staticmethod
     def tensor_stats(value: torch.Tensor) -> dict[str, Any]:
@@ -122,6 +136,240 @@ class NumericsDiagnostics:
                 stream.write(line + "\n")
                 stream.flush()
 
+    def _append_training_record(self, record: dict[str, Any]) -> None:
+        if self.rank != 0:
+            return
+        rendered = {
+            "rank": self.rank,
+            "epoch": self.epoch,
+            "optimizer_step": self.optimizer_step,
+            **record,
+        }
+        line = json.dumps(rendered, sort_keys=True, allow_nan=False)
+        if self.training_log_path is not None:
+            self.training_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.training_log_path.open("a", encoding="utf-8") as stream:
+                stream.write(line + "\n")
+                stream.flush()
+
+    def is_detailed_step(self) -> bool:
+        return (
+            self.detailed_step_range is None
+            or self.detailed_step_range[0] <= self.optimizer_step <= self.detailed_step_range[1]
+        )
+
+    @staticmethod
+    def _safe_float(value: Any) -> float | None:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            value = value.detach().item()
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    @staticmethod
+    def _small_tensor_values(value: torch.Tensor, *, limit: int = 256) -> list[Any] | None:
+        if value.numel() > limit:
+            return None
+        values = value.detach().cpu().reshape(-1).tolist()
+
+        def safe(item: Any) -> Any:
+            if isinstance(item, list):
+                return [safe(nested) for nested in item]
+            if isinstance(item, float) and not math.isfinite(item):
+                return None
+            return item
+
+        return safe(values)
+
+    def record_q_head_activation(
+        self, inputs: tuple[torch.Tensor, ...], output: torch.Tensor
+    ) -> None:
+        """Capture the Q-head input/output and their backward gradients in the step window."""
+
+        if self.rank != 0 or not self.is_detailed_step():
+            return
+        call_index = self.q_head_forward_call_index
+        self.q_head_forward_call_index += 1
+        input_tensor = inputs[0] if inputs else None
+        self._append_training_record({
+            "event": "q_head_forward",
+            "call_index": call_index,
+            "input": self.tensor_stats(input_tensor) if isinstance(input_tensor, torch.Tensor) else None,
+            "output": self.tensor_stats(output),
+            "output_values": self._small_tensor_values(output),
+        })
+        for tensor_name, tensor in (("input", input_tensor), ("output", output)):
+            if isinstance(tensor, torch.Tensor) and tensor.requires_grad:
+                tensor.register_hook(
+                    lambda gradient, name=tensor_name, call=call_index: (
+                        self._append_training_record({
+                            "event": "q_head_activation_gradient",
+                            "call_index": call,
+                            "tensor": name,
+                            "stats": self.tensor_stats(gradient),
+                        }),
+                        gradient,
+                    )[1]
+                )
+
+    def record_loss_batch(
+        self,
+        *,
+        loss: torch.Tensor,
+        metrics: Mapping[str, Any],
+        outputs: Mapping[str, torch.Tensor] | None,
+        batch: Mapping[str, torch.Tensor],
+        model: torch.nn.Module,
+    ) -> None:
+        """Write raw ACT loss, components, masks, Q values and logit ranges."""
+
+        if self.rank != 0 or not self.is_detailed_step():
+            return
+        outputs = outputs or {}
+        loss_components = {
+            name: {
+                "shape": list(value.shape) if isinstance(value, torch.Tensor) else [],
+                "stats": self.tensor_stats(value) if isinstance(value, torch.Tensor) else None,
+                "value": self._safe_float(value),
+            }
+            for name, value in metrics.items()
+            if name.endswith("_loss")
+        }
+        metric_values = {
+            name: self._safe_float(value)
+            for name, value in metrics.items()
+            if not name.endswith("_loss")
+        }
+        loss_semantics = {
+            "total_formula": "lm_loss + 0.5 * (q_halt_loss + q_continue_loss)",
+            "lm_loss": {
+                "token_loss": "stablemax_cross_entropy; ignore_index=-100; valid_mask=labels != -100",
+                "sequence_denominator": "valid token count per row, clamped to 1",
+                "reduction": "sum(token_loss / per_row_denominator) over batch and sequence",
+            },
+            "q_halt_loss": {
+                "function": "binary_cross_entropy_with_logits",
+                "target": "sequence_correct: every non-ignored label token predicted correctly",
+                "reduction": "sum over batch; no halted-example mask",
+            },
+            "q_continue_loss": {
+                "function": "binary_cross_entropy_with_logits",
+                "target": "detached target_q_continue when ACT continuation is enabled",
+                "reduction": "sum over batch; absent when target_q_continue is absent",
+            },
+        }
+        labels = batch.get("labels")
+        valid_mask = labels.ne(-100) if isinstance(labels, torch.Tensor) else None
+        per_row_valid_counts = (
+            valid_mask.sum(dim=-1) if valid_mask is not None else None
+        )
+        sequence_correct = None
+        if (
+            valid_mask is not None
+            and isinstance(outputs.get("preds"), torch.Tensor)
+        ):
+            preds = outputs["preds"]
+            token_correct = valid_mask & preds.eq(labels)
+            sequence_correct = token_correct.sum(dim=-1).eq(valid_mask.sum(dim=-1))
+
+        q_head_parameters = {}
+        for name, parameter in model.named_parameters():
+            if name.endswith(("inner.q_head.weight", "inner.q_head.bias")):
+                q_head_parameters[name] = self.tensor_stats(parameter)
+        prediction_logits = outputs.get("logits")
+        tensor_stats = {
+            name: self.tensor_stats(value)
+            for name in ("q_halt_logits", "q_continue_logits", "target_q_continue")
+            if isinstance((value := outputs.get(name)), torch.Tensor)
+        }
+        q_values = {
+            name: self._small_tensor_values(value)
+            for name in ("q_halt_logits", "q_continue_logits", "target_q_continue")
+            if isinstance((value := outputs.get(name)), torch.Tensor)
+        }
+        self._append_training_record({
+            "event": "loss_batch_before_backward",
+            "raw_backward_loss": {
+                "shape": list(loss.shape),
+                "stats": self.tensor_stats(loss),
+                "value": self._safe_float(loss),
+            },
+            "loss_components": loss_components,
+            "loss_component_shapes": {
+                name: record["shape"] for name, record in loss_components.items()
+            },
+            "loss_semantics": loss_semantics,
+            "batch_reductions": {
+                "labels_shape": list(labels.shape) if isinstance(labels, torch.Tensor) else None,
+                "valid_token_mask_shape": list(valid_mask.shape) if valid_mask is not None else None,
+                "valid_tokens_per_row": (
+                    per_row_valid_counts.detach().cpu().tolist()
+                    if per_row_valid_counts is not None else None
+                ),
+                "lm_denominators_after_clamp_min_1": (
+                    per_row_valid_counts.clamp_min(1).detach().cpu().tolist()
+                    if per_row_valid_counts is not None else None
+                ),
+                "q_halt_targets_sequence_correct": (
+                    sequence_correct.detach().cpu().tolist()
+                    if sequence_correct is not None else None
+                ),
+                "halt_loss_mask": None,
+                "q_losses_divided_by_batch_size": False,
+            },
+            "outputs": {
+                "prediction_logits": (
+                    self.tensor_stats(prediction_logits)
+                    if isinstance(prediction_logits, torch.Tensor) else None
+                ),
+                "q_tensors": tensor_stats,
+                "q_values": q_values,
+            },
+            "q_head_parameters_before_backward": q_head_parameters,
+            "other_metrics": metric_values,
+        })
+
+    def record_adam_atan2_square_overflow_risk(
+        self, optimizer: torch.optim.Optimizer, model: torch.nn.Module
+    ) -> None:
+        """Stop before AdamATan2's fused `grad * grad` overflows its opmath dtype."""
+
+        if optimizer.__class__.__name__ != "AdamATan2":
+            return
+        for _name, parameter in model.named_parameters():
+            gradient = parameter.grad
+            if gradient is None or not gradient.is_floating_point():
+                continue
+            opmath_dtype = torch.float64 if parameter.dtype == torch.float64 else torch.float32
+            square_limit = math.sqrt(torch.finfo(opmath_dtype).max)
+            absolute_gradient = gradient.detach().to(opmath_dtype).abs()
+            overflow_mask = absolute_gradient > square_limit
+            overflow_count = int(overflow_mask.sum().detach().cpu().item())
+            if overflow_count:
+                stats = self.tensor_stats(gradient)
+                self._record({
+                    **self._base_record(
+                        stage="before_optimizer_step",
+                        tensor_name=f"gradient.{_name}.squared_for_exp_avg_sq",
+                    ),
+                    "failure_kind": "overflow_if_squared",
+                    "shape": list(gradient.shape),
+                    "dtype": str(gradient.dtype),
+                    "non_finite_count": 0,
+                    "overflow_count": overflow_count,
+                    "max_abs_gradient": stats["max_abs"],
+                    "safe_max_abs_gradient": square_limit,
+                    "opmath_dtype": str(opmath_dtype),
+                    "first_invalid_operation": (
+                        "AdamATan2 CUDA kernel computes grad * grad before updating exp_avg_sq"
+                    ),
+                })
+                return
+
     def begin_recursion_forward(
         self, *, h_cycles: int, l_cycles: int, l_layers: int
     ) -> None:
@@ -159,7 +407,7 @@ class NumericsDiagnostics:
     def start_block_invocation(
         self, module_path: str, layer_index: int | None, hidden_states: torch.Tensor
     ) -> int | None:
-        if self.current_recursion_call is None:
+        if self.current_recursion_call is None or not self.is_detailed_step():
             return None
         invocation_id = len(self.invocations)
         label = dict(self.current_recursion_call)
@@ -180,6 +428,8 @@ class NumericsDiagnostics:
     def record_invocation_tensor(
         self, module_path: str, operation: str, value: torch.Tensor
     ) -> None:
+        if not self.is_detailed_step():
+            return
         invocation_id = self.invocation_by_module.get(module_path)
         if invocation_id is None:
             return
@@ -235,7 +485,8 @@ class NumericsDiagnostics:
     def finish_recursion_forward(self) -> None:
         """Emit forward/gradient summaries and recurrent norm trends for this batch."""
 
-        if not self.invocations:
+        if not self.invocations or not self.is_detailed_step():
+            self.invocations = []
             return
         activation_groups: dict[str, dict[str, list[float]]] = {}
         gradient_groups: dict[str, dict[str, list[float]]] = {}
@@ -278,6 +529,8 @@ class NumericsDiagnostics:
     ) -> None:
         """Record per-parameter, module, and whole-model norms at a gradient stage."""
 
+        if not self.is_detailed_step():
+            return
         parameters = [(name, parameter) for name, parameter in model.named_parameters()]
         parameter_records: dict[str, Any] = {}
         module_squared_norms: dict[str, float] = {}
@@ -356,12 +609,33 @@ class NumericsDiagnostics:
                     value,
                     stage=phase,
                 )
+        parameter_stats = (
+            self.tensor_stats(parameter) if isinstance(parameter, torch.Tensor) else None
+        )
+        parameter_group = None
+        if parameter is not None:
+            for group_index, group in enumerate(optimizer.param_groups):
+                if any(item is parameter for item in group["params"]):
+                    parameter_group = {
+                        "group_index": group_index,
+                        "lr": self._safe_float(group.get("lr")),
+                        "betas": list(group.get("betas", ())) or None,
+                        "epsilon": self._safe_float(group.get("eps")),
+                        "weight_decay": self._safe_float(group.get("weight_decay")),
+                        "parameter_count": len(group["params"]),
+                    }
+                    break
+        step = state.get("step")
         self._append_propagation_record({
             "event": "q_head_optimizer_state",
             "phase": phase,
             "optimizer_class": optimizer.__class__.__name__,
+            "optimizer_module": optimizer.__class__.__module__,
             "parameter_found": parameter is not None,
+            "parameter_stats": parameter_stats,
+            "parameter_group": parameter_group,
             "state_initialized": bool(state),
+            "step": self._safe_float(step),
             "fields": fields,
         })
 
@@ -375,6 +649,7 @@ class NumericsDiagnostics:
         self.epoch = int(epoch)
         self.optimizer_step = int(optimizer_step)
         if batch is not None and "puzzle_identifiers" in batch:
+            self.q_head_forward_call_index = 0
             raw_ids = batch["puzzle_identifiers"].detach().reshape(-1).cpu().tolist()
             self.batch_ids = sorted({int(item) for item in raw_ids})
             self.batch_names = (

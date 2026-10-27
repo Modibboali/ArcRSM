@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.metadata
+import importlib.util
 from itertools import islice
 import json
 import logging
@@ -168,6 +169,14 @@ def _install_numerics_hooks(loss_model, diagnostics: NumericsDiagnostics) -> lis
             handles.append(
                 module.register_forward_pre_hook(
                     lambda _module, _args, _path=path: diagnostics.begin_l_level_call()
+                )
+            )
+        if path.endswith("inner.q_head"):
+            handles.append(
+                module.register_forward_hook(
+                    lambda _module, inputs, output: diagnostics.record_q_head_activation(
+                        inputs, output
+                    )
                 )
             )
 
@@ -739,6 +748,8 @@ def _runtime_environment(device: torch.device, world_size: int) -> dict[str, Any
         "python": platform.python_version(),
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
+        "adam_atan2": package_version("adam-atan2"),
+        "adam_atan2_backend_available": importlib.util.find_spec("adam_atan2_backend") is not None,
         "cxx11_abi": bool(torch._C._GLIBCXX_USE_CXX11_ABI)
         if hasattr(torch._C, "_GLIBCXX_USE_CXX11_ABI")
         else None,
@@ -934,6 +945,7 @@ def run(args: argparse.Namespace) -> int:
                 cpu_group=cpu_group,
                 log_path=run_dir / f"numerics_rank{rank}.jsonl",
                 puzzle_names=identifiers,
+                detailed_step_range=args.diagnose_step_range,
             )
             _install_numerics_hooks(loss_model, diagnostics)
             if rank == 0:
@@ -1389,6 +1401,19 @@ def run(args: argparse.Namespace) -> int:
             dist.destroy_process_group()
 
 
+def _parse_step_range(value: str) -> tuple[int, int]:
+    try:
+        first_text, last_text = value.split(":", maxsplit=1)
+        first, last = int(first_text), int(last_text)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "step range must use FIRST:LAST, for example 900:905"
+        ) from exc
+    if first < 1 or last < first:
+        raise argparse.ArgumentTypeError("step range must be a positive inclusive range")
+    return first, last
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", required=True, type=Path)
@@ -1414,6 +1439,13 @@ def parse_args() -> argparse.Namespace:
         "--diagnose-numerics",
         action="store_true",
         help="Enable opt-in tensor, gradient, parameter, optimizer-state, and distributed finite checks",
+    )
+    parser.add_argument(
+        "--diagnose-step-range",
+        type=_parse_step_range,
+        default=(900, 905),
+        metavar="FIRST:LAST",
+        help="Write detailed loss, Q-head, gradient, and activation records for this inclusive optimizer-step range",
     )
     parser.add_argument(
         "--stop-after-step",

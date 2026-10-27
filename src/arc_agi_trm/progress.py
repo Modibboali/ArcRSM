@@ -56,6 +56,7 @@ class TrainingProgress:
         self._rolling_training: deque[tuple[float, int, float, float, float]] = deque(
             maxlen=30
         )
+        self._rolling_loss_components: dict[str, deque[tuple[float, int]]] = {}
         self._last_learning_rate: float | None = None
         self._last_validation_loss: float | None = None
         self._last_validation_exact: float | None = None
@@ -127,7 +128,7 @@ class TrainingProgress:
         )
         loss, grid_accuracy, exact_accuracy = self._training_window()
         fields = [
-            f"Loss {_format_number(loss, '.3f')}",
+            f"Loss avg30 {_format_number(loss, '.3f')}",
             f"Grid {_format_number(None if grid_accuracy is None else grid_accuracy * 100, '.1f')}%",
             f"Exact {_format_number(None if exact_accuracy is None else exact_accuracy * 100, '.1f')}%",
             f"LR {_format_number(self._last_learning_rate, '.3g')}",
@@ -135,6 +136,12 @@ class TrainingProgress:
             f"Elapsed {_format_duration(elapsed)}",
             f"ETA ~{eta}",
         ]
+        for name, label in (("lm_loss", "LM"), ("q_halt_loss", "Qh"), ("q_continue_loss", "Qc")):
+            window = self._rolling_loss_components.get(name)
+            if window:
+                total = sum(value_sum for value_sum, _examples in window)
+                examples = sum(count for _value_sum, count in window)
+                fields.append(f"{label} avg30 {_format_number(total / max(1, examples), '.3f')}")
         if self._last_validation_loss is not None:
             fields.append(f"Val loss {_format_number(self._last_validation_loss, '.3f')}")
         if self._last_validation_exact is not None:
@@ -166,6 +173,10 @@ class TrainingProgress:
                 float(metric_count),
             )
         )
+        for name, value in step.get("training_loss_components", {}).items():
+            self._rolling_loss_components.setdefault(
+                str(name), deque(maxlen=30)
+            ).append((float(value) * examples, examples))
         if step.get("learning_rate") is not None:
             self._last_learning_rate = float(step["learning_rate"])
         self._epoch = int(step["epoch"])

@@ -385,7 +385,7 @@ def test_original_and_matched_baseline_presets_are_distinct():
     assert faithful["model"]["L_cycles"] == 6
     assert faithful["model"]["pos_encodings"] == "rope"
     assert faithful["optimization"]["global_batch_size"] == 64
-    assert faithful["optimization"]["expected_per_device_batch_size"] == 32
+    assert faithful["optimization"]["expected_per_device_batch_size"] == 16
     assert matched["model"]["L_cycles"] == 4
     assert matched["model"]["pos_encodings"] == "rope"
     assert matched["seed"] == 42
@@ -394,8 +394,11 @@ def test_original_and_matched_baseline_presets_are_distinct():
     assert matched["optimization"]["gradient_accumulation_steps"] == 1
     assert faithful["epochs"] == matched["epochs"] == 100
 
-    with pytest.raises(ValueError, match="resolves to 16 examples per rank"):
-        _validate_config(faithful, world_size=4)
+    faithful_plan = _validate_config(faithful, world_size=4)
+    assert faithful_plan["per_device_batch_size"] == 16
+    assert faithful_plan["microbatch_global_size"] == 64
+    assert faithful_plan["gradient_accumulation_steps"] == 1
+    assert faithful_plan["effective_global_batch_size"] == 64
 
     plan = _validate_config(matched, world_size=4)
     assert plan["per_device_batch_size"] == 8

@@ -722,6 +722,12 @@ def _append_jsonl(path: Path, record: dict[str, Any]) -> None:
         stream.flush()
 
 
+def _append_run_log(path: Path, message: str) -> None:
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(message.rstrip() + "\n")
+        stream.flush()
+
+
 def _runtime_environment(device: torch.device, world_size: int) -> dict[str, Any]:
     def package_version(name: str) -> str:
         try:
@@ -841,13 +847,13 @@ def run(args: argparse.Namespace) -> int:
             raise AssertionError("Model batch_size diverged from the resolved per-device batch")
         batch_plan["validation_per_device_batch_size"] = validation_dataset.local_batch_size
         if rank == 0:
-            print(
+            _append_run_log(
+                run_dir / "run.log",
                 f"TRM plan | ranks {world_size} | per-device batch "
                 f"{batch_plan['per_device_batch_size']} | global batch {global_batch_size} | "
                 f"accumulation {batch_plan['gradient_accumulation_steps']} | "
                 f"effective batch {batch_plan['effective_global_batch_size']} | "
                 f"optimizer steps {planned_total_steps}",
-                flush=True,
             )
 
         # All workers build identical initial weights; rank-specific RNG streams
@@ -879,10 +885,10 @@ def run(args: argparse.Namespace) -> int:
                 device=device,
             )
             if rank == 0:
-                print(
+                _append_run_log(
+                    run_dir / "run.log",
                     f"Resumed {resume_path.resolve()} at epoch {completed_epochs}, "
                     f"optimizer step {optimizer_step}",
-                    flush=True,
                 )
         else:
             completed_epochs, optimizer_step, carry, best_metrics = 0, 0, None, {}
@@ -896,10 +902,10 @@ def run(args: argparse.Namespace) -> int:
                     expected_config=config,
                 )
                 if rank == 0:
-                    print(
+                    _append_run_log(
+                        run_dir / "run.log",
                         "Initialized model weights from pretrained artifact; optimizer and "
                         f"scheduler start fresh: {report['architecture']}",
-                        flush=True,
                     )
             seed_training_rank(int(config["seed"]), rank)
 
@@ -931,10 +937,10 @@ def run(args: argparse.Namespace) -> int:
             )
             _install_numerics_hooks(loss_model, diagnostics)
             if rank == 0:
-                print(
+                _append_run_log(
+                    run_dir / "run.log",
                     f"Opt-in numerical diagnostics enabled; per-rank logs: "
                     f"{run_dir / 'numerics_rank*.jsonl'}",
-                    flush=True,
                 )
 
         if rank == 0:
@@ -1040,12 +1046,6 @@ def run(args: argparse.Namespace) -> int:
                         **last_memory_record,
                     }
                     _append_jsonl(smoke_memory_path, memory_record)
-                    if progress is not None:
-                        progress.write(
-                            f"Smoke step {update['optimizer_step']}/{args.smoke_test_steps} | "
-                            f"peak allocated {values[0] / (1024 ** 3):.2f} GiB | "
-                            f"reserved {values[1] / (1024 ** 3):.2f} GiB"
-                        )
                 torch.cuda.reset_peak_memory_stats(device)
 
             try:
@@ -1106,12 +1106,6 @@ def run(args: argparse.Namespace) -> int:
                 with (run_dir / "run.log").open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(summary, sort_keys=True) + "\n")
                     stream.flush()
-                if progress is not None:
-                    progress.write(
-                        f"Smoke test complete | {completed_smoke_steps} optimizer steps | "
-                        f"peak allocated {summary.get('peak_allocated_bytes_max_rank', 0) / (1024 ** 3):.2f} GiB | "
-                        f"reserved {summary.get('peak_reserved_bytes_max_rank', 0) / (1024 ** 3):.2f} GiB"
-                    )
                 progress_status = "smoke-complete"
             return 0
 
@@ -1165,10 +1159,7 @@ def run(args: argparse.Namespace) -> int:
                     f"Progress estimate adjusted: sampler emitted {actual_epoch_updates} "
                     f"optimizer updates in epoch {epoch}; planned {predicted_epoch_updates}."
                 )
-                if progress:
-                    progress.write(message)
-                else:
-                    print(message, flush=True)
+                _append_run_log(run_dir / "run.log", message)
             if actual_epoch_updates != predicted_epoch_updates:
                 optimizer_updates_by_epoch[epoch - 1] = actual_epoch_updates
                 optimizer_steps_by_epoch = [0]
@@ -1340,14 +1331,14 @@ def run(args: argparse.Namespace) -> int:
                             "experiment_name": config.get("name"),
                         },
                     )
-                if rank == 0 and progress is not None:
+                if rank == 0:
                     checkpoint_message = (
                         f"Checkpoint saved | epoch {epoch} | step {optimizer_step} | "
                         f"{record['checkpoint_path']}"
                     )
                     if improved:
                         checkpoint_message += " | new best"
-                    progress.write(checkpoint_message)
+                    _append_run_log(run_dir / "run.log", checkpoint_message)
             record["peak_gpu_memory_allocated_bytes"] = int(
                 torch.cuda.max_memory_allocated(device) if torch.cuda.is_available() else 0
             )
@@ -1370,10 +1361,7 @@ def run(args: argparse.Namespace) -> int:
                     f"Stopped at epoch boundary after optimizer_step={optimizer_step}; "
                     f"diagnostic checkpoint={run_dir / 'latest.pt'}"
                 )
-                if progress:
-                    progress.write(message)
-                else:
-                    print(message, flush=True)
+                _append_run_log(run_dir / "run.log", message)
                 progress_status = "diagnostic-stop"
             else:
                 save_pretrained(
@@ -1391,10 +1379,7 @@ def run(args: argparse.Namespace) -> int:
                     f"Completed {config['epochs']} epochs for {config['name']}; "
                     f"latest={run_dir / 'latest.pt'}, best={run_dir / 'best.pt'}"
                 )
-                if progress:
-                    progress.write(message)
-                else:
-                    print(message, flush=True)
+                _append_run_log(run_dir / "run.log", message)
                 progress_status = "complete"
         return 0
     finally:

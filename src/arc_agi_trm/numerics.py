@@ -116,7 +116,6 @@ class NumericsDiagnostics:
             **record,
         }
         line = json.dumps(rendered, sort_keys=True, allow_nan=False)
-        print(line, file=sys.stderr, flush=True)
         if self.propagation_log_path is not None:
             self.propagation_log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.propagation_log_path.open("a", encoding="utf-8") as stream:

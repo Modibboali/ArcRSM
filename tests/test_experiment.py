@@ -475,7 +475,9 @@ def test_numerics_diagnostic_logs_first_bad_tensor_and_batch_identifiers(tmp_pat
     assert stats["std"] == pytest.approx(0.5)
 
 
-def test_recursion_diagnostic_labels_shared_invocations_and_captures_gradients(tmp_path) -> None:
+def test_recursion_diagnostic_labels_shared_invocations_and_captures_gradients(
+    tmp_path, capsys
+) -> None:
     diagnostics = NumericsDiagnostics(
         rank=0,
         world_size=1,
@@ -503,6 +505,9 @@ def test_recursion_diagnostic_labels_shared_invocations_and_captures_gradients(t
                 loss = loss + output.sum()
     loss.backward()
     diagnostics.finish_recursion_forward()
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == ""
 
     records = [
         json.loads(line)

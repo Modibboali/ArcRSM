@@ -12,12 +12,12 @@ effective_global_batch_size = global_batch_size * gradient_accumulation_steps
 
 The failed Kaggle run used `global_batch_size: 768` with four ranks, so the
 standalone attention TRM received 192 examples per GPU. With accumulation 1,
-its effective update batch was 768. The current faithful architecture preset
-sets global batch 64 and expects 32 examples per GPU. At four ranks it
-resolves to 16 per GPU, so startup rejects this mismatch until those values
-are aligned. `model.batch_size` is derived from the resolved per-device value
-because the upstream model uses it to size its local sparse-embedding
-buffers. Startup prints the resolved values before model construction.
+its effective update batch was 768. The faithful architecture preset uses
+global batch 64 and expects 16 examples per GPU, which resolves consistently
+at world size 4. `model.batch_size` is derived from the resolved per-device
+value because the upstream model uses it to size its local sparse-embedding
+buffers. The resolved plan is recorded in `run.log` before model construction;
+normal training output is reserved for the tqdm bar.
 
 The failed run's 192-example allocation explains the reported CUDA OOM during
 the RoPE attention forward. The architecture-faithful preset remains
@@ -100,10 +100,9 @@ torchrun --standalone --max-restarts=0 --nproc_per_node=4 scripts/train_mamba2_h
 
 The 100-epoch command is documented but has not been launched. The faithful
 architecture preset remains available at
-`configs/trm_baseline_100_epochs.json`. Its current global batch 64 and
-expected per-device batch 32 are inconsistent at world size 4, so it is
-rejected at startup; align those values before using that preset. The earlier
-Kaggle run used global 768 and resolved to 192 per device.
+`configs/trm_baseline_100_epochs.json`, with global batch 64 and per-device
+batch 16 at world size 4. The earlier Kaggle run used global 768 and resolved
+to 192 per device.
 
 ## Progress total and logs
 
@@ -125,7 +124,9 @@ learning rate, recent examples per second, elapsed time, and approximate ETA.
 After validation completes, it separately displays validation loss and
 validation task exact match. Gradient accumulation's final short window counts
 as an optimizer update. Full epoch summaries remain in `metrics.jsonl` and
-`run.log`; notebook output contains no epoch-metrics JSON dump.
+`run.log`. Numerical propagation summaries are written to
+`propagation_rank*.jsonl`; normal training notebook output contains only the
+tqdm bar.
 
 ## Local verification
 
